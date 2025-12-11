@@ -157,6 +157,3 @@ class SwishFunction(torch.autograd.Function):
 
 my_swish = SwishFunction.apply
 
-
-
-

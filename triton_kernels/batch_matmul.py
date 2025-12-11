@@ -288,10 +288,6 @@ class BatchedMatmulFunctionNaive(torch.autograd.Function):
         x, y = ctx.saved_tensors
 
         dx, dy = batched_matmul_bwd_naive(x, y, dz)
-        
-        # dx = batched_matmul_fwd_cpu(dz, y.permute(0, 2, 1).contiguous().clone())
-
-        # dy = batched_matmul_fwd_cpu(x.permute(0, 2, 1).contiguous(), dz)
 
         return dx, dy
 
@@ -624,10 +620,6 @@ class BatchedMatmulFunction(torch.autograd.Function):
         x, y = ctx.saved_tensors
 
         dx, dy = batched_matmul_bwd(x, y, dz)
-        
-        # dx = batched_matmul_fwd_cpu(dz, y.permute(0, 2, 1).contiguous().clone())
-
-        # dy = batched_matmul_fwd_cpu(x.permute(0, 2, 1).contiguous(), dz)
 
         return dx, dy
 
