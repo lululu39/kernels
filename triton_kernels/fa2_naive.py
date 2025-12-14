@@ -72,7 +72,7 @@ def flash_attention_naive_fwd_kernel(
         b_acc = b_r * b_acc + tl.sum(b_p, 1)
 
         # here we use broadcast for b_r
-        # NOTE: dunno why cast to b_q dtype, copied from fla
+        # NOTE: we always cast to original data dtype when we are calculating the direct target
         b_o = b_o * b_r[:, None] + tl.dot(b_p.to(b_q.dtype), b_v) # partial sum of final o, [BT, BV]
 
     o_q = tl.arange(0, BT) + i_t * BT # offset for q block
@@ -89,7 +89,7 @@ def flash_attention_naive_fwd_kernel(
 
         b_s = tl.dot(b_q, b_k) * RCP_LN2 # [BT, BS]
 
-        b_s = tl.where((o_q[:, None] > o_k[None, :] & m_k[None, :]), b_s, float('-inf'))
+        b_s = tl.where((o_q[:, None] >= o_k[None, :] & m_k[None, :]), b_s, float('-inf'))
 
         b_m, b_mp = tl.maximum(b_m, tl.max(b_s, axis=1)), b_m
 
@@ -197,7 +197,7 @@ def flash_attention_naive_bwd_kernel_dq(
 
         b_s = tl.dot(b_q, b_k) * scale * RCP_LN2
 
-        b_p = tl.where((o_q[:, None] > o_k[None, :]) & m_k[None, :], tl.exp2(b_s - b_lse[:, None]), 0)
+        b_p = tl.where((o_q[:, None] >= o_k[None, :]) & m_k[None, :], tl.exp2(b_s - b_lse[:, None]), 0)
         b_dp = tl.dot(b_do.to(tl.float32), b_v) # dp = do @ v^T [BT, BS] NOTE: why cast?
         b_ds = b_p * (b_dp - b_delta[:, None]) # [BT, BS]
         b_dq += tl.dot(b_ds.to(b_k.dtype), tl.trans(b_k)) # [BT, BK] NOTE: why cast?
@@ -263,6 +263,8 @@ def flash_attention_naive_bwd_kernel_dkv(
     o_k = tl.arange(0, BT) + i_t * BT
     m_k = o_k < T
 
+    # NOTE: for p, dp, ds, we are directly calculating their transposes here!
+
     for i_s in tl.range(i_t * BT, min((i_t + 1) * BT, T), BS):
         # traverse along rows of q with step size of BS, this is only for one block
         # so now i_s is the row of q, o, do, lse and delta
@@ -271,5 +273,52 @@ def flash_attention_naive_bwd_kernel_dkv(
         p_lse = tl.make_block_ptr(lse + bos, (T,), (1,), (i_s,), (BS,), (0,))
         p_delta = tl.make_block_ptr(delta + bos, (T,), (1,), (i_s,), (BS,), (0,))
 
-        o_q = tl.arange()
+        o_q = tl.arange(0, BS) + i_s
+        m_q = o_q < T
+
+        b_q = tl.load(p_q, boundary_check=(0,1))
+        b_do = tl.load(p_do, boundary_check=(0,1))
+        b_lse = tl.load(p_lse, boundary_check=(0,))
+        b_delta = tl.load(p_delta, boundary_check=(0,))
+
+        b_s = tl.dot(b_k, tl.trans(b_q)) * scale * RCP_LN2 # [BT, BS]
+        # NOTE: we have to change the lte brodcast order because we are dealing with tranposes.
+        b_p = tl.where((o_q[None, :] >= o_k[:, None]) & m_q[None, :], tl.exp2(b_s - b_lse[None, :]), 0) # [BT, BS]
+
+        b_dv += tl.dot(b_p.to(b_do.dtype), b_do)
+
+        b_dp = tl.dot(b_v, tl.trans(b_do)) # [BT, BS]
+        b_ds = b_p * (b_dp - b_delta[None, :]) # [BT, BS]
+        b_dk += tl.dot(b_ds.to(b_q.dtype), b_q) # [BT, BK]
+
+    for i_s in tl.range((i_t + 1) * BT, triton.cdiv(T, BS) * BS, BS):
+        # the rest of q rows to be computed
+        p_q = tl.make_block_ptr(q + bos * K, (T, K), (K, 1), (i_s, 0), (BS, BK), (1,0))
+        p_do = tl.make_block_ptr(do + bos * V, (T, V), (V, 1), (i_s, 0), (BS, BV), (1,0))
+        p_lse = tl.make_block_ptr(lse + bos, (T,), (1,), (i_s,), (BS,), (0,))
+        p_delta = tl.make_block_ptr(delta + bos, (T,), (1,), (i_s,), (BS,), (0,))
+
+        m_q = o_q < T
+
+        b_q = tl.load(p_q, boundary_check=(0,1))
+        b_do = tl.load(p_do, boundary_check=(0,1))
+        b_lse = tl.load(p_lse, boundary_check=(0,))
+        b_delta = tl.load(p_delta, boundary_check=(0,))
+
+        b_s = tl.dot(b_k, tl.trans(b_q)) * scale * RCP_LN2 # [BT, BS]
+        # NOTE: we have to change the lte brodcast order because we are dealing with tranposes.
+        b_p = tl.where(m_q[None, :], tl.exp2(b_s - b_lse[None, :]), 0) # [BT, BS]
+
+        b_dv += tl.dot(b_p.to(b_do.dtype), b_do)
+
+        b_dp = tl.dot(b_v, tl.trans(b_do)) # [BT, BS]
+        b_ds = b_p * (b_dp - b_delta[None, :]) # [BT, BS]
+        b_dk += tl.dot(b_ds.to(b_q.dtype), b_q) # [BT, BK]
+
+    b_dk *= scale  # same as dq
+    # NOTE: casting
+    tl.store(p_dk, b_dk.to(p_dk.dtype.element_ty), boundary_check=(0,1))
+    tl.store(p_dv, b_dv.to(p_dv.dtype.element_ty), boundary_check=(0,1))
+        
+
 
