@@ -95,6 +95,7 @@ def flash_attention_2_fwd_kernel(
 
         b_s = tl.dot(b_q, b_k) * scale * RCP_LN2 # [BT, BS]
 
+        # NOTE: we did this to b_s because we need to calculate maximum value
         if causal:
             b_s = tl.where((o_q[:, None] >= o_k[None, :]) & (m_k[None, :]), b_s, float('-inf'))
         else:
