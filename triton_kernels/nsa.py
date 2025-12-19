@@ -13,6 +13,67 @@ from fla.utils import autocast_custom_bwd, autocast_custom_fwd, check_shared_mem
 # NOTE: dimensions offsets that are not used in block ptr offsets are then used on the base pointer
 
 @triton.jit
+def _compare_and_swap(
+    x,
+    ids,
+    flip,
+    i: tl.constexpr,
+    n_dims: tl.constexpr,
+):
+    n_outer: tl.constexpr = x.numel >> n_dims
+    shape: tl.constexpr = [n_outer * 2**i, 2, 2**(n_dims - i - 1)]
+    y = tl.reshape(x, shape)
+    # slice left/right with 'stride' 2**(n_dims - i - 1)
+    mask = tl.arange(0, 2)[None, :, None]
+    left = tl.broadcast_to(tl.sum(y * (1 - mask), 1)[:, None, :], shape).to(y.dtype)
+    right = tl.broadcast_to(tl.sum(y * mask, 1)[:, None, :], shape).to(y.dtype)
+    left = tl.reshape(left, x.shape)
+    right = tl.reshape(right, x.shape)
+    # idx
+    y_idx = tl.reshape(ids, shape)
+    left_idx = tl.broadcast_to(tl.sum(y_idx * (1 - mask), 1)[:, None, :], shape)
+    right_idx = tl.broadcast_to(tl.sum(y_idx * mask, 1)[:, None, :], shape)
+    left_idx = tl.reshape(left_idx, x.shape).to(y_idx.dtype)
+    right_idx = tl.reshape(right_idx, x.shape).to(y_idx.dtype)
+    # actual compare-and-swap
+    idtype = tl.core.get_int_dtype(bitwidth=x.dtype.primitive_bitwidth, signed=True)
+    ileft = left.to(idtype, bitcast=True)
+    iright = right.to(idtype, bitcast=True)
+    ix = x.to(idtype, bitcast=True)
+
+    cond = (left > right) != flip
+    ret = ix ^ tl.where(cond, ileft ^ iright, tl.zeros_like(ix))
+    new_ids = ids ^ tl.where(cond, left_idx ^ right_idx, tl.zeros_like(ids))
+    return ret.to(x.dtype, bitcast=True), new_ids
+
+
+@triton.jit
+def _bitonic_merge(
+    x,
+    ids,
+    stage: tl.constexpr,
+    order: tl.constexpr,
+    n_dims: tl.constexpr,
+):
+    n_outer: tl.constexpr = x.numel >> n_dims
+    tl.static_assert(stage <= n_dims)
+    # flip denotes whether to re-arrange sub-sequences of elements in ascending or
+    # descending order.
+    # if flip = 00000000... then all elements will be re-arranged ascendingly at this stage
+    # if flip = 00110011... then all the elements will be re-arranged alternatingly (with
+    # a stride of 2) at this stage
+    if order == 2:
+        shape: tl.constexpr = [n_outer * 2**(n_dims - 1 - stage), 2, 2**stage]
+        flip = tl.reshape(tl.broadcast_to(tl.arange(0, 2)[None, :, None], shape), x.shape)
+    else:
+        flip = order
+    # perform `stage` rounds of `compare-and-swap`
+    for i in tl.static_range(stage):
+        x, ids = _compare_and_swap(x, ids, flip, i + (n_dims - stage), n_dims)
+    return x, ids
+
+
+@triton.jit
 def nsa_compression_fwd_kernel(
     q,
     k,
@@ -47,7 +108,7 @@ def nsa_compression_fwd_kernel(
     TC = tl.cdiv(T, BS) # total blocks in original sequence
     NC = (i_t + 1) // BS # how many valid blocks for a query group at position i_t
 
-    bos = i_b * T, eos = (i_b + 1) * T
+    bos, eos = i_b * T, (i_b + 1) * T
     boc = i_b * TC
 
     # use base to aceess last two dims block
@@ -146,7 +207,7 @@ def nsa_compression_bwd_kernel_dq(
     TC = tl.cdiv(T, BS) # total blocks in original sequence
     NC = (i_t + 1) // BS # how many valid blocks for a query group at position i_t
 
-    bos = i_b * T, eos = (i_b + 1) * T
+    bos, eos = i_b * T, (i_b + 1) * T
     boc = i_b * TC
 
     # precompute the base pointer
@@ -211,7 +272,7 @@ def nsa_compression_bwd_kernel_dkv(
     lse,
     delta,
     scale,
-    offsets, # varlen
+    cu_seqlens, # varlen
     token_indices, # varlen
     chunk_offsets, # varlen
     T,
@@ -225,7 +286,7 @@ def nsa_compression_bwd_kernel_dkv(
     BS: tl.constexpr, # block size of compression
     BK: tl.constexpr,
     BV: tl.constexpr, # NOTE: does not to be 1 because the dq now is NV * (*q.shape), so we can do partiton along V
-    USE_OFFSETS: tl.constexpr, # meta param
+    IS_VARLEN: tl.constexpr, # meta param
 ):
     # q [B, T, HQ, K]
     # k [B, TC, H, K] NOTE: already compressed k and v
@@ -236,6 +297,8 @@ def nsa_compression_bwd_kernel_dkv(
     # lse [B, T, HQ]
     # delta [B, T, HQ]
 
+    # one element of a kv head means a group of G query heads
+
     # why dk and dq need NV but dv dont? because former two need dp, which is partial if you partition along V dimension
 
 
@@ -245,7 +308,7 @@ def nsa_compression_bwd_kernel_dkv(
     TC = tl.cdiv(T, BS) # total blocks in original sequence
     NC = (i_t + 1) // BS # how many valid blocks for a query group at position i_t
 
-    bos = i_b * T, eos = (i_b + 1) * T
+    bos, eos = i_b * T, (i_b + 1) * T
     boc = i_b * TC
 
     k += (boc * H + i_h) * K
@@ -302,4 +365,118 @@ def nsa_compression_bwd_kernel_dkv(
     tl.store(p_dk, b_dk.to(p_dk.dtype.element_ty), boundary_check=(0,1))
     tl.store(p_dv, b_dv.to(p_dv.dtype.element_ty), boundary_check=(0,1))
 
+
+def nsa_topk_kernel(
+    q,
+    k,
+    v,
+    lse,
+    scale,
+    block_indices, # indices of selected block
+    cu_seqlens,
+    token_indices,
+    chunk_offsets,
+    T,
+    B: tl.constexpr,
+    H: tl.constexpr,
+    HQ: tl.constexpr,
+    G: tl.constexpr, # NOTE: groups of query sharing the same KV set, this is a must because NSA use GQA
+    K: tl.constexpr,
+    S: tl.constexpr, # number of seletced block
+    BC: tl.constexpr, # NOTE: block step size along compressed k and v
+    BS: tl.constexpr, # block size of compression
+    BK: tl.constexpr,
+    IS_VARLEN: tl.constexpr, # meta param
+):
     
+    # does not involve v so only two-dim grid
+    # we deal with G query heads in a block, so paralleize in q
+    # lse [B, T, H]
+    # block indices [B, T, H, S]
+    # S <= BC // 2 because we will discard BS//2 history max in bitonic merge, so we do not want to lose potetial top-S max
+
+    i_t, i_bh = tl.program_id(0), tl.program_id(1)
+
+    i_b, i_h = i_bh // H, i_bh % H
+
+    TC = tl.cdiv(T, BS)
+    # NOTE: when (i_t + 1) % BS == 0, NC != IC
+    NC = (i_t + 1) // BS # this is a number
+    IC = i_t // BS # this is a offset
+
+    bos, eos = i_b * T, (i_b + 1) * T
+    boc = i_b * TC
+
+    p_q = tl.make_block_ptr(q + (bos + i_t) * HQ * K, (HQ, K), (K, 1), (i_h * G, 0), (G, BK), (1,0))
+    p_lse = tl.make_block_ptr(lse + (bos + i_t) * HQ, (HQ,), (1,), (i_h * G), (G,), (0,))
+
+    b_q = tl.load(p_q, boundary_check=(0,1))
+    b_lse = tl.load(p_lse, boundary_check=(0,)) # NOTE: we assume the lse is returned in compression, so we do not recompute
+
+    # NOTE: the first half of b_i always descends and second half always ascends if we are updating
+    b_i = tl.zeros([BC], dtype=tl.float32) # [BC], where BC >= 2 * S because we are going to use bitonic merge to sort top-k
+    o_i = tl.zeros([BC], dtype=tl.float32)
+    m_i = tl.arange(0, BC) < (BC // 2)
+
+    for i_c in tl.range(0, NC, BC):
+
+        # NOTE: here I use a difference iteration strategy
+        # NOTE: offset <= offset, while offset < number, vice versa
+        # NOTE: when can be equal, use offset, when can not, use number
+
+        o_c = tl.arange(0, BC) + i_c
+
+        p_k = tl.make_block_ptr(k + (boc * H + i_h) * K, (K, TC), (1, H * K), (0, i_c), (BK, BC), (0,1))
+
+        # [BK, BC]
+        b_k = tl.load(p_k, boundary_check=(0,1))
+
+        b_s = tl.dot(b_q, b_k) * scale # [G, BC]
+
+        b_s = tl.where((o_c < NC)[None, :], b_s, float('-inf'))
+
+        # always select 1st and last two blocks
+        # NOTE: why, though
+
+        b_p = tl.where(((o_c == 0) | (o_c == IC - 1) | (o_c == IC) ), 1., tl.exp(b_s - b_lse[:, None]))
+
+        # accumulate scores across all G heads
+        b_i, b_ip = tl.sum(b_p, 0), b_i # [BC]
+
+        # NOTE: difference
+        # discard invalid block offsets
+        o_i, o_ip = tl.where(o_c < NC, o_c, -1), o_i
+
+        n_dims: tl.constexpr = tl.standard._log2(BC)
+
+        # NOTE: it seems that we should first use order=2 when sorting smaller sequences, 
+        # then use order=1/0 when sorting the whole sequence when our sequence is already bitonic
+
+        for i in tl.static_range(1, n_dims):
+            # we do bitnonic merge
+            # NOTE: cast
+            b_i, o_i = _bitonic_merge(b_i, o_i.to(tl.int32), i, 2, n_dims)
+
+        if i_c == 0:
+            # descending order
+            b_i, o_i = _bitonic_merge(b_i, o_i.to(tl.int32), n_dims, True, n_dims)
+        else:
+            b_i, o_i = _bitonic_merge(b_i, o_i.to(tl.int32), n_dims, False, n_dims) # ascending
+            b_i = b_ip * m_i + b_i * (1 - m_i)
+            o_i = o_ip * m_i + o_i * (1 - m_i)
+            # then we make the bitonic sequence fully sorted: descending order
+            b_i, o_i = _bitonic_merge(b_i, o_i.to(tl.int32), n_dims, True, n_dims)
+    
+    # NOTE: pretty weird code
+    m_top = tl.arange(0, BC//S) == 0
+    b_top = tl.sum(m_top[:, None] * tl.reshape(o_i, [BC//S, S]), 0)
+
+    # keep the block shape same to our data shape, which is S,
+
+    p_b = tl.make_block_ptr(block_indices + (bos + i_t) * H * S, (H * S,), (1,), (i_h * S,), (S,), (0,))
+
+    tl.store(p_b, b_top.to(p_b.dtype.element_ty))
+
+
+
+            
