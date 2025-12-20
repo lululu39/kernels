@@ -113,7 +113,7 @@ def nsa_compression_fwd_kernel(
 
     # use base to aceess last two dims block
 
-    p_q = tl.make_block_ptr(p + (bos + i_t) * HQ * K, (HQ, K), (K, 1), (i_h * G, 0), (G, K), (1, 0))
+    p_q = tl.make_block_ptr(p + (bos + i_t) * HQ * K, (HQ, K), (K, 1), (i_h * G, 0), (G, BK), (1, 0))
 
     p_o = tl.make_block_ptr(o + (bos + i_t) * HQ * V, (HQ, V), (V, 1), (i_h * G, i_v * BV), (G, BV), (1, 0))
 
@@ -478,5 +478,106 @@ def nsa_topk_kernel(
     tl.store(p_b, b_top.to(p_b.dtype.element_ty))
 
 
+@triton.jit
+def nsa_selection_fwd_kernel(
+    q,
+    k,
+    v,
+    o,
+    lse,
+    scale,
+    block_indices, # indices of selected blocks
+    block_counts, # how many blocks each query chooses, can be less than S
+    cu_seqlens, # varlen
+    token_indices, # varlen
+    chunk_offsets, # varlen
+    T,
+    H: tl.constexpr,
+    HQ: tl.constexpr,
+    G: tl.constexpr, # NOTE: groups of query sharing the same KV set, this is a must because NSA use GQA
+    K: tl.constexpr,
+    V: tl.constexpr,
+    S: tl.constexpr, # number of seletced block (max value)
+    BS: tl.constexpr, # block size of compression
+    BK: tl.constexpr,
+    BV: tl.constexpr,
+    IS_VARLEN: tl.constexpr, # meta param
+    USE_BLOCK_COUNTS: tl.constexpr,
+):
+    
+    # q [B, T, HQ, K]
+    # k [B, T, H, K] NOTE: non-compressed k and v
+    # v [B, T, H, V]
+    # o [B, T, HQ, V]
+    # lse [B, T, HQ]
+    # block_indices [B, T, H, S]
 
-            
+    i_v, i_t, i_bh = tl.program_id(0), tl.program_id(1), tl.program_id(2)
+
+    i_b, i_h = i_bh // H, i_bh % H
+
+    bos = i_b * T
+
+    p_q = tl.make_block_ptr(q + (bos + i_t) * HQ * K, (HQ, K), (K, 1), (i_h * G, 0), (G, BK), (1,0))
+
+    b_q = tl.load(p_q, boundary_check=(0,1))
+
+    k += (bos * H + i_h) * K
+    v += (bos * H + i_h) * V
+    block_indices += (bos + i_t) * H * S + i_h * S
+
+    NS = S # number of selected blocks, currently default to S (the maximum value)
+
+    p_o = tl.make_block_ptr(o + (bos + i_t) * HQ * V, (HQ, V), (V, 1), (i_h * G, i_v * BV), (G, BV), (1, 0)) # [G, BV]
+
+    p_lse = tl.make_block_ptr(o + (bos + i_t) * HQ, (HQ,), (1,), (i_h * G,), (G,), (0,)) # [G]
+
+    b_o = tl.zeros([G, BV], dtype=tl.float32)
+
+    b_m = tl.full([G], float('-inf'), dtype=tl.float32)
+    b_acc = tl.zeros([G], dtype=tl.float32)
+
+    for i in tl.range(NS):
+
+        i_s = tl.load(block_indices + i).to(tl.int32) * BS # the true offsets for selected k and v block
+
+        if i_s <= i_t & i_s >= 0:
+            # ensure causality
+            o_s = i_s + tl.arange(0, BS) # dont know if this is requireed, since we do not select incploete block
+            # NOTE: but one scnatios may be that S is larger than num of valid blocks, so we inevetbly choose some invalid block
+
+            p_k = tl.make_block_ptr(k, (K, T), (1, H * K), (0, i_s), (BV, BS), (0, 1))
+
+            p_v = tl.make_block_ptr(v, (T, V), (H * V, 1), (i_s, i_v * BV), (BS, BV), (1,0))
+
+            b_k = tl.load(p_k, boundary_check=(0,1)) # [BK, BS]
+
+            b_v = tl.load(p_v, boundary_check=(0,1)) # [BS, BV]
+
+            b_s = tl.dot(b_q, b_k) * scale # [G, BS]
+
+            # NOTE: still needs some masking to avoid corner cases
+            b_s = tl.where((o_s <= i_t)[None, :], b_s, float('-inf'))
+
+            b_m, b_mp = tl.maximum(tl.max(b_s, 1), b_m), b_m # [G]
+
+            b_r = tl.exp(b_mp - b_m) # [G]
+
+            b_p = tl.exp(b_s - b_m[:, None])
+
+            b_acc = b_acc * b_r + tl.sum(b_p, 1)
+
+            b_o += tl.dot(b_p.to(b_v.dtype), b_v) # [G, BV]
+    
+    b_o = b_o / b_acc[:, None]
+    b_m += tl.log(b_acc)
+    tl.store(lse, b_m.to(p_lse.dtype.element_ty), boundary_check=(0,))
+    tl.store(p_o, b_o.to(p_o.dtype.element_ty), boundary_check=(0,1))
+
+
+
+
+
+
+
+
