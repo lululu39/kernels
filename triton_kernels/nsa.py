@@ -513,7 +513,7 @@ def nsa_selection_fwd_kernel(
     # lse [B, T, HQ]
     # block_indices [B, T, H, S]
 
-    i_v, i_t, i_bh = tl.program_id(0), tl.program_id(1), tl.program_id(2)
+    i_t, i_v, i_bh = tl.program_id(0), tl.program_id(1), tl.program_id(2)
 
     i_b, i_h = i_bh // H, i_bh % H
 
@@ -669,3 +669,120 @@ def nsa_selection_bwd_kernel_dq(
     b_dq *= scale # wherether you scale q or not, for dq we always need to scale in the end. why? see the formula
 
     tl.store(p_dq, b_dq.to(p_dq.dtype.element_ty), boundary_check=(0,1))
+
+@triton.jit
+def nsa_selection_kernel_block_mask(
+    block_indices,
+    block_counts,
+    block_mask,
+    H: tl.constexpr,
+    S: tl.constexpr,
+    T: tl.constexpr,
+    BS: tl.constexpr,
+    NS: tl.constexpr,
+):
+    # not sure why NS = tl.cdiv(T, BS) is used, because block_indices shoulw not contain indices larger than NS
+
+    # NOTE: imo, NS shoule be T // BS, no cdiv since we want complete blocks
+    # block_indices [B, T, H, S]
+    i_b, i_t, i_hs = tl.program_id(0), tl.program_id(1), tl.program_id(2)
+
+    i_h, i_s = i_hs // S, i_hs % S
+
+    bos = i_b * T
+
+    p_i = tl.make_block_ptr(block_indices + ((bos + i_t) * H + i_h) * S, (S,), (1,), (i_s,), (1,), (0,))
+
+    b_i = tl.load(p_i, boundary_check=(0,))
+
+    b_m = ((b_i < (i_t + 1) // BS) & (b_i >= 0)) # again, first part is not required since we did this in top-k kernel and set invalid indices to -1
+
+    if b_i < NS & b_i >= 0:
+        tl.store(block_mask + ((bos + i_t) * H + i_h) * NS + b_i, b_m.to(block_mask.dtype.element_ty))
+    
+
+@triton.jit
+def nsa_selection_bwd_kernel_dkv(
+    q,
+    k,
+    v,
+    lse,
+    delta,
+    do,
+    dk,
+    dv,
+    scale,
+    block_indices, # indices of selected blocks
+    block_counts, # how many blocks each query chooses, can be less than S
+    block_mask,
+    cu_seqlens, # varlen
+    token_indices, # varlen
+    chunk_offsets, # varlen
+    T,
+    B: tl.constexpr, # NOTE
+    H: tl.constexpr,
+    HQ: tl.constexpr,
+    M: tl.constexpr, # NOTE: besically 
+    G: tl.constexpr, # NOTE: groups of query sharing the same KV set, this is a must because NSA use GQA
+    K: tl.constexpr,
+    V: tl.constexpr,
+    S: tl.constexpr, # number of seletced block (max value)
+    BS: tl.constexpr, # block size of compression
+    BK: tl.constexpr,
+    BV: tl.constexpr,
+    IS_VARLEN: tl.constexpr, # meta param
+):
+    # bk and bv should be [BS, BK] and [BV, BS]
+
+    # NOTE: we use NS = cdiv(T, BS) to iterate all blocks (including incomplete ones)
+    # because dk and dv is torch.empty, so we nned to store zero into the incomplete block (eve if we do not calculate it)
+    # as for block_mask kernel, i don't think cdiv is required, since block_mask is initially zero
+    i_s, i_v, i_bh = tl.program_id(0), tl.program_id(1), tl.program_id(2)
+
+    i_b, i_h = i_bh // H, i_bh % H
+
+    all = B * T
+
+    bos = i_b * T
+
+    p_k = tl.make_block_ptr(k + (bos * H + i_h) * K, (T, K), (H * K, 1), (i_s * BS, 0), (BS, BK), (1,0))
+    p_v = tl.make_block_ptr(v + (bos * H + i_h) * V, (T, V), (H * V, 1), (i_s * BS, i_v * BV), (BS, BV), (1,0))
+
+    # NOTE: k needs an extra NV dimension
+    p_dk = tl.make_block_ptr(dk + ((i_v * all + bos) * H + i_h) * K, (T, K), (H * K, 1), (i_s * BS, 0), (BS, BK), (1,0))
+    p_dv = tl.make_block_ptr(dv + (bos * H + i_h) * V, (T, V), (H * V, 1), (i_s * BS, i_v * BV), (BS, BV), (1,0))
+
+    b_k = tl.load(p_k, boundary_check=(0,1)) # [BS, BK]
+    b_v = tl.load(p_v, boundary_check=(0,1)) # [BS, BV]
+
+    p_dk = tl.zeros([BS, BK], dtype=tl.float32)
+    p_dv = tl.zeros([BS, BV], dtype=tl.float32)
+
+    o_s = tl.arange(0, BS) + i_S * BS
+
+    for i in tl.range(i_s * BS, T):
+        b_m = tl.load(block_mask + (bos + i) * H * M + i_h * M + i_s)
+
+        if b_m:
+            # this k/v block is valid at query position i
+            p_q = tl.make_block_ptr(q + (bos + i) * HQ * K, (HQ, K), (K, 1), (i_h * G, 0), (G, BK), (1,0))
+            p_lse = tl.make_block_ptr(lse + (bos + i) * HQ, (HQ,), (1,), (i_h * G,), (G,), (0,))
+            p_delta = tl.make_block_ptr(delta + (bos + i) * HQ, (HQ,), (1,), (i_h * G,), (G,), (0,))
+            p_do = tl.make_block_ptr(do + (bos + i) * HQ*V, (HQ, V), (V, 1), (i_h * G, i_v * BV), (G, BV), (1, 0))
+
+            b_q = tl.load(p_q, boundary_check=(0,1)) # [G, BK]
+            b_lse = tl.load(p_lse, boundary_check=(0,)) # [G,]
+            b_delta = tl.load(p_delta, boundary_check=(0,1)) # [G,]
+            b_do = tl.load(p_do, boundary_check=(0,1)) # [G, BV]
+
+            b_s = tl.dot(b_k, tl.trans(b_q)) # [BS, G]
+            b_p = tl.exp(b_s - b_lse[None, :])
+            b_p = tl.where((o_s <= i)[:, None], b_p, 0)
+            b_dp = tl.dot(b_v, tl.trans(b_do)) # [BS, G]
+            b_ds = b_p * (b_dp - b_delta[None, :]) # [BS, G]
+
+            b_dv += tl.dot(b_p.to(b_do.dtype), b_do)
+            b_dk += tl.dot(b_ds.to(b_q.dtype), b_q) # [BS, BK]
+    
+    tl.store(p_dk, b_dk.to(p_dk.dtype.element_ty), boundary_check=(0,1))
+    tl.store(p_dv, b_dv.to(p_dv.dtype.element_ty), boundary_check=(0,1))
