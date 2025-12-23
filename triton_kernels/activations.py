@@ -157,3 +157,75 @@ class SwishFunction(torch.autograd.Function):
 
 my_swish = SwishFunction.apply
 
+@triton.jit
+def relu_fwd_kernel(
+    x,
+    y,
+    T: tl.constexpr,
+    D: tl.constexpr
+):
+    i_t = tl.program_id(0)
+    o = tl.arange(0, D) + i_t * D
+    b_x = tl.load(x + o, o < T)
+    b_y = tl.where((b_x > 0), b_x, 0)
+    tl.store(y + o, b_y.to(y.dtype.element_ty), o < T)
+
+@triton.jit
+def relu_bwd_kernel(
+    dy,
+    dx,
+    x,
+    T: tl.constexpr,
+    D: tl.constexpr
+):
+    i_t = tl.program_id(0)
+    o = tl.arange(0, D) + i_t * D
+    b_x = tl.load(x + o, o < T)
+    b_dy = tl.load(dy + o, o < T)
+    b_dx = tl.where((b_x > 0), b_dy, 0)
+    tl.store(dx + o, b_dx.to(dx.dtype.element_ty), o < T)
+
+def relu_fwd(
+    x: torch.Tensor
+):
+    T = x.numel()
+    D = min(32, max(16, triton.next_power_of_2(T)))
+    y = torch.empty_like(x)
+    relu_fwd_kernel[(triton.cdiv(T, D),)](
+        x=x,
+        y=y,
+        T=T,
+        D=D
+    )
+    return y
+
+def relu_bwd(
+    x: torch.Tensor,
+    dy: torch.Tensor,
+):
+    T = x.numel()
+    D = min(32, max(16, triton.next_power_of_2(T)))
+    dx = torch.empty_like(x)
+    relu_bwd_kernel[(triton.cdiv(T, D),)](
+        x=x,
+        dy=dy,
+        dx=dx,
+        T=T,
+        D=D
+    )
+    return dx
+
+
+class ReLUFunction(torch.autograd.Function):
+
+    @staticmethod
+    def forward(ctx, x):
+        ctx.save_for_backward(x)
+        return relu_fwd(x)
+
+    @staticmethod
+    def backward(ctx, dy):
+        x, = ctx.saved_tensors
+        return relu_bwd(x, dy)
+
+my_relu = ReLUFunction.apply
