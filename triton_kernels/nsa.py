@@ -786,3 +786,233 @@ def nsa_selection_bwd_kernel_dkv(
     
     tl.store(p_dk, b_dk.to(p_dk.dtype.element_ty), boundary_check=(0,1))
     tl.store(p_dv, b_dv.to(p_dv.dtype.element_ty), boundary_check=(0,1))
+
+
+def nsa_compression_fwd(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    block_size: int,
+    scale: float,
+    cu_seqlens: torch.LongTensor | None = None,
+    token_indices: torch.LongTensor | None = None, # used for varlen
+):
+    B, T, HQ, K, V, H = *q.shape, v.shape[-1], k.shape[-2]
+    G = HQ // H
+    BC = BS = block_size
+
+    BK = min(128, triton.next_power_of_2(K))
+    BV = min(128, triton.next_power_of_2(V))
+
+    NK = triton.cdiv(K, BK)
+    NV = triton.cdiv(V, BV)
+    assert NK == 1, "The key dimension can not be larger than 256"
+
+    # NOTE: we ignore varlen here!
+
+    # chunk_offsets = prepare_chunk_offsets(cu_seqlens, BS) if cu_seqlens is not None else None
+    chunk_offsets =  None
+
+    grid = (T, NV, B * H)
+
+    o = torch.empty(B, T, HQ, V, dtype=v.dtype, device=q.device) # NOTE: the dtype and q device
+    lse = torch.empty(B, T, HQ, dtype=torch.float, device=q.device)
+
+    nsa_compression_fwd_kernel[grid](
+        q=q,
+        k=k,
+        v=v,
+        o=o,
+        lse=lse,
+        scale=scale,
+        cu_seqlens=cu_seqlens,
+        token_indices=token_indices,
+        chunk_offsets=chunk_offsets,
+        T=T,
+        H=H,
+        HQ=HQ,
+        G=G,
+        K=K,
+        V=V,
+        BC=BC,
+        BS=BS,
+        BK=BK,
+        BV=BV,
+    )
+
+    return o, lse
+
+
+def nsa_compression_bwd(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    o: torch.Tensor,
+    do: torch.Tensor,
+    lse: torch.Tensor,
+    scale: float,
+    block_size: int,
+    cu_seqlens: torch.LongTensor | None = None,
+    token_indices: torch.LongTensor | None = None,
+):
+    
+    B, T, HQ, K, V, H = *q.shape, v.shape[-1], k.shape[-2]
+    G = HQ // H
+
+    BC = BS = block_size
+
+    BK = max(triton.next_power_of_2(K), 16) # BK less than K
+    BV = min(128, max(triton.next_power_of_2(v.shape[-1]), 16))
+
+    NK = triton.cdiv(K, BK)
+    NV = triton.cdiv(V, BV)
+
+    chunk_indices, chunk_offsets = None, None
+    NC = triton.cdiv(triton.cdiv(T, BS), BC)
+
+    assert NK == 1, "The key dimension can not be larger than 256"
+
+    from fa2 import flash_attention_2_bwd_preprocess as preprocess
+
+    delta = preprocess(o, do)
+
+    dq = torch.empty(NV, *q.shape, dtype=q.dtype if NV == 1 else torch.float, device=q.device)
+
+    grid = (T, NV, B * H)
+
+    nsa_compression_bwd_kernel_dq[grid](
+        q=q,
+        k=k,
+        v=v,
+        do=do,
+        dq=dq,
+        lse=lse,
+        delta=delta,
+        scale=scale,
+        cu_seqlens=cu_seqlens,
+        token_indices=token_indices,
+        chunk_offsets=chunk_indices,
+        T=T,
+        B=B,
+        H=H,
+        HQ=HQ,
+        G=G,
+        K=K,
+        V=V,
+        BC=BC,
+        BS=BS,
+        BK=BK,
+        BV=BV,
+    )
+
+    dq = dq.sum(0) # we accumulate results along NV
+
+    dk = torch.empty(NV, *k.shape, dtype=k.dtype if NV == 1 else torch.float, device=q.device)
+    dv = torch.empty(*v.shape, dtype=v.dtype, device=q.device)
+
+    grid = [NC, NV, B * H]
+
+    nsa_compression_bwd_kernel_dkv[grid](
+        q=q,
+        k=k,
+        v=v,
+        do=do,
+        dk=dk,
+        dv=dv,
+        lse=lse,
+        delta=delta,
+        scale=scale,
+        cu_seqlens=cu_seqlens,
+        token_indices=token_indices,
+        chunk_offsets=chunk_indices,
+        T=T,
+        B=B,
+        H=H,
+        HQ=HQ,
+        G=G,
+        K=K,
+        V=V,
+        BC=BC,
+        BS=BS,
+        BK=BK,
+        BV=BV,
+    )
+
+    dk = dk.sum(0)
+
+    return dq, dk, dv
+
+class NSACompressionFunction(torch.autograd.Function):
+
+    @staticmethod
+    @contiguous
+    @autocast_custom_fwd
+    def forward(ctx, q, k, v, block_size, scale, cu_seqlens):
+        ctx.dtype = q.dtype
+
+        # token_indices = prepare_token_indices(cu_seqlens) if cu_seqlens is not None else None
+        token_indices =  None
+
+        o, lse = nsa_compression_fwd(
+            q=q,
+            k=k,
+            v=v,
+            block_size=block_size,
+            scale=scale,
+            cu_seqlens=cu_seqlens,
+            token_indices=token_indices
+        )
+
+        ctx.save_for_backward(q, k, v, o, lse)
+        ctx.cu_seqlens = cu_seqlens
+        ctx.token_indices = token_indices
+        ctx.block_size = block_size
+        ctx.scale = scale
+
+        # NOTE: the cast here
+        return o.to(q), lse
+
+    @staticmethod
+    @contiguous
+    @autocast_custom_bwd
+    def backward(ctx, do):
+        q, k, v, o, lse = ctx.saved_tensors
+        dq, dk, dv = nsa_compression_bwd(
+            q=q,
+            k=k,
+            v=v,
+            o=o,
+            do=do,
+            lse=lse,
+            scale=ctx.scale,
+            block_size=ctx.block_size,
+            cu_seqlens=ctx.cu_seqlens,
+            token_indices=ctx.token_indices,
+        )
+        return dq.to(q), dk.to(k), dk.to(v), None, None, None
+
+
+def nsa_compression(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    block_size: int,
+    scale: float = None,
+    cu_seqlens: torch.LongTensor | None = None,
+):
+    if scale is None:
+        scale = k.shape[-1] ** -0.5
+
+    return NSACompressionFunction.apply(
+        q,
+        k,
+        v,
+        block_size,
+        scale,
+        cu_seqlens
+    )
+    
+
+
+
+    
