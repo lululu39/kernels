@@ -491,7 +491,6 @@ def nsa_selection_fwd_kernel(
     block_counts, # how many blocks each query chooses, can be less than S
     cu_seqlens, # varlen
     token_indices, # varlen
-    chunk_offsets, # varlen
     T,
     H: tl.constexpr,
     HQ: tl.constexpr,
@@ -591,7 +590,6 @@ def nsa_selection_bwd_kernel_dq(
     block_counts, # how many blocks each query chooses, can be less than S
     cu_seqlens, # varlen
     token_indices, # varlen
-    chunk_offsets, # varlen
     T,
     B: tl.constexpr, # NOTE
     H: tl.constexpr,
@@ -716,8 +714,7 @@ def nsa_selection_bwd_kernel_dkv(
     block_counts, # how many blocks each query chooses, can be less than S
     block_mask,
     cu_seqlens, # varlen
-    token_indices, # varlen
-    chunk_offsets, # varlen
+    chunk_indices, # varlen
     T,
     B: tl.constexpr, # NOTE
     H: tl.constexpr,
@@ -942,6 +939,7 @@ def nsa_compression_bwd(
 
     return dq, dk, dv
 
+@torch.compile
 class NSACompressionFunction(torch.autograd.Function):
 
     @staticmethod
@@ -1013,6 +1011,252 @@ def nsa_compression(
     )
     
 
-
-
+def nsa_selection_fwd(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    block_indices: torch.LongTensor, # obtained with top-k
+    block_counts: torch.LongTensor | int,
+    block_size: int,
+    scale: float,
+    cu_seqlens: torch.LongTensor | None = None,
+    token_indices: torch.LongTensor | None = None, # used for varlen
+):
     
+    B, T, HQ, K, H, V, S = *q.shape, K.shape[-2], v.shape[-1], block_indices.shape[-1]
+    G = HQ // H
+    BS = block_size
+
+    BK = min(128, triton.next_power_of_2(K)) # generally we do not split K
+    BV = min(128, triton.next_power_of_2(V))
+
+    NK = triton.cdiv(K, BK)
+    NV = triton.cdiv(V, BV)
+
+    lse = torch.empty(B, T, H, dtype=torch.float, device=q.device) # NOTE: use float
+    o = torch.empty(B, T, HQ, V, dtype=v.dtype, device=q.device)
+
+    grid = (T, NV, B * H) # why T, because only one query position is processed in each block
+    nsa_selection_fwd_kernel[grid](
+        q=q,
+        k=k,
+        v=v,
+        o=o,
+        lse=lse,
+        scale=scale,
+        block_indices=block_indices,
+        block_counts=block_counts,
+        cu_seqlens=cu_seqlens,
+        token_indices=token_indices,
+        T=T,
+        H=H,
+        HQ=HQ,
+        G=G,
+        K=K,
+        V=V,
+        S=S,
+        BS=BS,
+        BK=BK,
+        BV=BV,
+    )
+
+    return o, lse
+
+def nsa_selection_block_mask(
+    block_indices: torch.LongTensor,
+    block_counts: torch.LongTensor | int,
+    cu_seqlens: torch.LongTensor,
+    block_size: int,
+):
+    B, T, H, S = block_indices.shape
+    BS = block_size
+    NS = triton.cdiv(T, BS)
+    block_mask = torch.zeros(B, T, H, NS, dtype=torch.bool, device=block_indices.device)
+
+    nsa_selection_kernel_block_mask[(B, T, H * S)](
+        block_indices=block_indices,
+        block_counts=block_counts,
+        block_mask=block_mask,
+        H=H,
+        S=S,
+        T=T,
+        BS=BS,
+        NS=NS,
+    )
+    return block_mask
+
+def nsa_selection_bwd(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    o: torch.Tensor,
+    do: torch.Tensor,
+    lse: torch.Tensor,
+    block_indices: torch.LongTensor, # obtained with top-k
+    block_counts: torch.LongTensor | int,
+    block_size: int,
+    scale: float,
+    cu_seqlens: torch.LongTensor | None = None,
+    token_indices: torch.LongTensor | None = None, # used for varlen 
+):
+    B, T, HQ, K, H, V, S = *q.shape, K.shape[-2], v.shape[-1], block_indices.shape[-1]
+    G = HQ // H
+    BS = block_size
+    BK = max(triton.next_power_of_2(K), 16)
+    BV = min(128, max(triton.next_power_of_2(v.shape[-1]), 16)) # again, split v, not k
+
+    NV = triton.cdiv(V, BV)
+    
+    NS = triton.cdiv(T, BS) # used for dkv kernel
+
+    from fa2 import flash_attention_2_bwd_preprocess as preprocess
+
+    delta = preprocess(o, do)
+
+    dq = torch.empty(NV, *q.shape, dtype=q.dtype if NV == 1 else torch.float, device=q.device)
+    grid = (T, NV, B * H)
+    nsa_selection_bwd_kernel_dq[grid](
+        q=q,
+        k=k,
+        v=v,
+        lse=lse,
+        delta=delta,
+        do=do,
+        dq=dq,
+        block_indices=block_indices,
+        block_counts=block_counts,
+        cu_seqlens=cu_seqlens,
+        token_indices=token_indices,
+        scale=scale,
+        T=T,
+        B=B,
+        H=H,
+        HQ=HQ,
+        G=G,
+        K=K,
+        V=V,
+        S=S,
+        BS=BS,
+        BK=BK,
+        BV=BV,
+    )
+
+    chunk_indices = None
+    dq = dq.sum(0)
+
+    grid = (NS, NV, B * H)
+
+    block_mask = nsa_selection_block_mask(block_indices=block_indices, block_counts=block_counts, cu_seqlens=cu_seqlens, block_size=block_size)
+
+    dk = torch.empty(NV, *k.shape, dtype=k.dtype if NV == 1 else torch.float, device=q.device)
+    dv = torch.empty(v.shape, dtype=v.dtype, device=q.device)
+
+    nsa_selection_bwd_kernel_dkv[grid](
+        q=q,
+        k=k,
+        v=v,
+        lse=lse,
+        delta=delta,
+        do=do,
+        dk=dk,
+        dv=dv,
+        block_mask=block_mask,
+        cu_seqlens=cu_seqlens,
+        chunk_indices=chunk_indices,
+        scale=scale,
+        T=T,
+        B=B,
+        H=H,
+        HQ=HQ,
+        G=G,
+        K=K,
+        V=V,
+        M=block_mask.shape[-1],
+        BS=BS,
+        BK=BK,
+        BV=BV,
+    )
+
+    dk = dk.sum(0)
+    return dq, dk, dv
+
+
+@torch.compile
+class NSASelectionFunction(torch.autograd.Function):
+
+    @staticmethod
+    @contiguous
+    @autocast_custom_fwd
+    def forward(ctx, q, k, v, block_indices, block_counts, block_size, scale, cu_seqlens):
+        ctx.dtype = q.dtype
+
+        # token_indices = prepare_token_indices(cu_seqlens) if cu_seqlens is not None else None
+        token_indices = None
+
+        o, lse = nsa_selection_fwd(
+            q=q,
+            k=k,
+            v=v,
+            block_indices=block_indices,
+            block_counts=block_counts,
+            block_size=block_size,
+            scale=scale,
+            cu_seqlens=cu_seqlens,
+            token_indices=token_indices,
+        )
+
+        ctx.save_for_backward(q, k, v, o, lse)
+        ctx.block_indices = block_indices
+        ctx.block_counts = block_counts
+        ctx.cu_seqlens = cu_seqlens
+        ctx.token_indices = token_indices
+        ctx.block_size = block_size
+        ctx.scale = scale
+
+        return o.to(q)
+
+    @staticmethod
+    @contiguous
+    @autocast_custom_bwd
+    def backward(ctx, do):
+        q, k, v, o, lse = ctx.saved_tensors
+        dq, dk, dv = nsa_compression_bwd(
+            q=q,
+            k=k,
+            v=v,
+            o=o,
+            lse=lse,
+            do=do,
+            block_indices=ctx.block_indices,
+            block_counts=ctx.block_counts,
+            block_size=ctx.block_size,
+            scale=ctx.scale,
+            cu_seqlens=ctx.cu_seqlens,
+            token_indices=ctx.token_indices,
+        )
+        return dq.to(q), dk.to(k), dv.to(v), None, None, None, None, None
+
+def nsa_selection(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    block_indices: torch.LongTensor,
+    block_counts: torch.LongTensor | int,
+    block_size: int,
+    scale: float = None,
+    cu_seqlens: torch.LongTensor | None = None,
+):
+    if scale is None:
+        scale = k.shape[-1] ** -0.5
+    
+    return NSASelectionFunction.apply(
+        q,
+        k,
+        v,
+        block_indices,
+        block_counts,
+        block_size,
+        scale,
+        cu_seqlens
+    )
+
