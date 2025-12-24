@@ -229,3 +229,79 @@ class ReLUFunction(torch.autograd.Function):
         return relu_bwd(x, dy)
 
 my_relu = ReLUFunction.apply
+
+
+@triton.jit
+def softplus_fwd_kernel(
+    x,
+    y,
+    T: tl.constexpr,
+    D: tl.constexpr,
+):
+    i_t = tl.program_id(0)
+    o = tl.arange(0, D) + i_t * D
+    b_x = tl.load(x + o, o < T)
+    b_y = tl.maximum(b_x, 0) + tl.log(1 + tl.exp(-(tl.abs(b_x))))
+    tl.store(y + o, b_y.to(y.dtype.element_ty), o < T)
+
+@triton.jit
+def softplus_bwd_kernel(
+    x,
+    dx,
+    dy,
+    T: tl.constexpr,
+    D: tl.constexpr
+):
+    i_t = tl.program_id(0)
+
+    o = i_t * D + tl.arange(0, D)
+    m = o < T
+
+    b_x = tl.load(x + o, m)
+    b_dy = tl.load(dy + o, m)
+    b_dx = b_dy * (1.0 / (1.0 + tl.exp(-b_x)))
+    tl.store(dx + o, b_dx.to(dx.dtype.element_ty), m)
+
+def softplus_fwd(
+    x: torch.Tensor
+):
+    T = x.numel()
+    D = min(32, max(16, triton.next_power_of_2(T)))
+    y = torch.empty_like(x)
+    softplus_fwd_kernel[(triton.cdiv(T, D),)](
+        x=x,
+        y=y,
+        T=T,
+        D=D
+    )
+    return y
+
+def softplus_bwd(
+    x: torch.Tensor,
+    dy: torch.Tensor,
+):
+    T = x.numel()
+    D = min(32, max(16, triton.next_power_of_2(T)))
+    dx = torch.empty_like(x)
+    softplus_bwd_kernel[(triton.cdiv(T, D),)](
+        x=x,
+        dx=dx,
+        dy=dy,
+        T=T,
+        D=D
+    )
+    return dx
+
+class SoftPlusFunction(torch.autograd.Function):
+
+    @staticmethod
+    def forward(ctx, x):
+        ctx.save_for_backward(x)
+        return softplus_fwd(x)
+
+    @staticmethod
+    def backward(ctx, dy):
+        x, = ctx.saved_tensors
+        return softplus_bwd(x, dy)
+
+my_softplus = SoftPlusFunction.apply
