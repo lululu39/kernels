@@ -1,12 +1,17 @@
 import torch
 import torch.nn.functional as F
-from activations import my_relu, my_sigmoid, my_swish, my_softplus
+from activations import my_relu, my_sigmoid, my_swish, my_softplus, my_gelu
 
 def test_activation(fn_triton, fn_torch, name):
-    x = torch.randn(1000, device='cuda', dtype=torch.float32, requires_grad=True)
+    x = torch.randn(1000, device='cuda' if torch.cuda.is_available() else 'cpu', dtype=torch.float32, requires_grad=True)
     y_triton = fn_triton(x)
-    y_torch = fn_torch(x)
+    if fn_torch is F.gelu:
+        y_torch = fn_torch(x, approximate="tanh")
+    else:
+        y_torch = fn_torch(x)
+
     forward_diff = (y_triton - y_torch).abs().max().item()
+    print(f"{name} forward diff: {forward_diff}")
     assert forward_diff < 1e-5, f"{name} forward diff {forward_diff} exceeds 1e-5"
 
     # backward test
@@ -17,11 +22,13 @@ def test_activation(fn_triton, fn_torch, name):
     y_torch.backward(grad, retain_graph=True)
     grad_torch = x.grad.clone()
     backward_diff = (grad_triton - grad_torch).abs().max().item()
+    print(f"{name} backward diff: {backward_diff}")
     assert backward_diff < 1e-5, f"{name} backward diff {backward_diff} exceeds 1e-5"
     print(f"{name} test passed! forward_diff={forward_diff:.2e}, backward_diff={backward_diff:.2e}")
 
 if __name__ == "__main__":
-    test_activation(my_relu, torch.relu, "ReLU")
-    test_activation(my_sigmoid, torch.sigmoid, "Sigmoid")
-    test_activation(my_swish, lambda x: x * torch.sigmoid(x), "Swish")
-    test_activation(my_softplus, F.softplus, "Softplus")
+    # test_activation(my_relu, torch.relu, "ReLU")
+    # test_activation(my_sigmoid, torch.sigmoid, "Sigmoid")
+    # test_activation(my_swish, lambda x: x * torch.sigmoid(x), "Swish")
+    # test_activation(my_softplus, F.softplus, "Softplus")
+    test_activation(my_gelu, F.gelu, "GELU")

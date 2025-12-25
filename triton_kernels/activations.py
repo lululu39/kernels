@@ -305,3 +305,90 @@ class SoftPlusFunction(torch.autograd.Function):
         return softplus_bwd(x, dy)
 
 my_softplus = SoftPlusFunction.apply
+
+# we use tanh to approximate for gelu
+@triton.jit
+def gelu_fwd_kernel(
+    x,
+    y,
+    T: tl.constexpr,
+    D: tl.constexpr,
+):
+    i_t = tl.program_id(0)
+    o = tl.arange(0, D) + i_t * D
+    b_x = tl.load(x + o, o < T)
+    c = 0.044715
+    a = 0.7978845608
+    b_u = a * (b_x + c * b_x * b_x * b_x)
+    # tanh
+    b_tanh_u = tl.where(b_u >= 0, (1 - 2 / (1 + tl.exp(2 * b_u))), (2 / (1 + tl.exp(-2 * b_u)) - 1)) 
+    b_y = 0.5 * b_x * (1 + b_tanh_u)
+    tl.store(y + o, b_y, o < T)
+
+@triton.jit
+def gelu_bwd_kernel(
+    x,
+    dx,
+    dy,
+    T: tl.constexpr,
+    D: tl.constexpr,
+):
+    i_t = tl.program_id(0)
+    o = tl.arange(0, D) + i_t * D
+    b_x = tl.load(x + o, o < T)
+    b_dy = tl.load(dy + o, o < T)
+    c = 0.044715
+    a = 0.7978845608
+    b_u = a * (b_x + c * b_x * b_x * b_x)
+    # tanh
+    b_tanh_u = tl.where(b_u >= 0, (1 - 2 / (1 + tl.exp(2 * b_u))), (2 / (1 + tl.exp(-2 * b_u)) - 1)) 
+
+    b_t1 = 1 + b_tanh_u
+    b_t2 = b_x * (1 - b_tanh_u * b_tanh_u) * a * (1 + 3 * c * b_x * b_x)
+    b_dx = b_dy * 0.5 * (b_t1 + b_t2)
+    tl.store(dx + o, b_dx, o < T)
+
+
+def gelu_fwd(
+    x: torch.Tensor
+):
+    T = x.numel()
+    D = min(32, max(16, triton.next_power_of_2(T)))
+    y = torch.empty_like(x)
+    gelu_fwd_kernel[(triton.cdiv(T, D),)](
+        x=x,
+        y=y,
+        T=T,
+        D=D
+    )
+    return y
+
+def gelu_bwd(
+    x: torch.Tensor,
+    dy: torch.Tensor,
+):
+    T = x.numel()
+    D = min(32, max(16, triton.next_power_of_2(T)))
+    dx = torch.empty_like(x)
+    gelu_bwd_kernel[(triton.cdiv(T, D),)](
+        x=x,
+        dx=dx,
+        dy=dy,
+        T=T,
+        D=D
+    )
+    return dx
+
+class GELUFunction(torch.autograd.Function):
+
+    @staticmethod
+    def forward(ctx, x):
+        ctx.save_for_backward(x)
+        return gelu_fwd(x)
+
+    @staticmethod
+    def backward(ctx, dy):
+        x, = ctx.saved_tensors
+        return gelu_bwd(x, dy)
+
+my_gelu = GELUFunction.apply
