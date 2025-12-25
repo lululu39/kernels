@@ -3,6 +3,14 @@ import triton
 import torch
 from fla.utils import autocast_custom_bwd, autocast_custom_fwd, check_shared_mem, contiguous
 
+try:
+    from flash_attn import flash_attn_varlen_func, flash_attn_func
+except ImportError:
+    flash_attn_varlen_func = None
+    flash_attn_func = None
+
+mean_pooling = None
+
 @triton.heuristics({
     'USE_OFFSETS': lambda args: args['offsets'] is not None
 })
@@ -369,7 +377,6 @@ def nsa_compression_bwd_kernel_dkv(
 def nsa_topk_kernel(
     q,
     k,
-    v,
     lse,
     scale,
     block_indices, # indices of selected block
@@ -1260,3 +1267,179 @@ def nsa_selection(
         cu_seqlens
     )
 
+
+def nsa_topk(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    lse: torch.Tensor,
+    block_counts: torch.LongTensor | int,
+    block_size: int = 64,
+    scale: float = None,
+    cu_seqlens: torch.LongTensor | None = None
+):
+    B, T, HQ, K, H = *q.shape, k.shape[-2]
+    G = HQ // K
+    S = block_counts if isinstance(block_counts, int) else block_counts.max().item()
+    S = triton.next_power_of_2(S) # NOTE: triton requires us to do so
+    BC = BS = block_size
+    BK = max(triton.next_power_of_2(K), 16)
+    assert BC >= 2 * S, f"BC ({BC}) must be greater than or equal to 2 * S ({S})"
+
+    block_indices = torch.zeros(B, T, H, S, dtype=torch.int32, device=q.device)
+
+    # token_indices = prepare_token_indices(cu_seqlens) if cu_seqlens is not None else None
+    # chunk_offsets = prepare_chunk_offsets(cu_seqlens, BS) if cu_seqlens is not None else None
+
+    token_indices = None
+    chunk_offsets = None
+    grid = (T, B * H)
+    nsa_topk_kernel[grid](
+        q=q,
+        k=k,
+        lse=lse,
+        scale=scale,
+        block_indices=block_indices,
+        cu_seqlens=cu_seqlens,
+        token_indices=token_indices,
+        chunk_offsets=chunk_offsets,
+        T=T,
+        H=H,
+        HQ=HQ,
+        G=G,
+        K=K,
+        S=S,
+        BC=BC,
+        BS=BS,
+        BK=BK,
+    )
+    return block_indices
+
+
+    
+
+def native_sparse_attention(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    g_cmp: torch.Tensor | None,
+    g_slc: torch.Tensor | None,
+    g_swa: torch.Tensor | None,
+    block_indices: torch.LongTensor | None,
+    block_counts: torch.LongTensor | int = 16,
+    block_size: int = 16,
+    window_size: int = 0,
+    scale: float | None = None,
+    cu_seqlens: torch.LongTensor | None = None,
+):
+    r"""
+    Args:
+        q (torch.Tensor):
+            queries of shape `[B, T, HQ, K]`.
+        k (torch.Tensor):
+            keys of shape `[B, T, H, K]`.
+            GQA is enforced here. The ratio of query heads (HQ) to key/value heads (H) must be a power of 2 and >=16.
+        v (torch.Tensor):
+            values of shape `[B, T, H, V]`.
+        g_cmp (torch.Tensor):
+            Gate score for compressed attention of shape `[B, T, HQ]`.
+        g_slc (torch.Tensor):
+            Gate score for selected attention of shape `[B, T, HQ]`.
+        g_swa (torch.Tensor):
+            Gate score for sliding attentionof shape `[B, T, HQ]`.
+        block_indices (torch.LongTensor):
+            Block indices of shape `[B, T, H, S]`.
+            `S` is the number of selected blocks for each query token, which is set to 16 in the paper.
+            If `g_cmp` is provided, the passed `block_indices` will be ignored.
+        block_counts (Optional[Union[torch.LongTensor, int]]):
+            Number of selected blocks for each query.
+            If a tensor is provided, with shape `[B, T, H]`,
+            each query can select the same number of blocks.
+            If not provided, it will default to 16.
+        block_size (int):
+            Selected block size. Default: 64.
+        window_size (int):
+            Sliding window size. Default: 0.
+        scale (Optional[float]):
+            Scale factor for attention scores.
+            If not provided, it will default to `1 / sqrt(K)`. Default: `None`.
+        cu_seqlens (torch.LongTensor):
+            Cumulative sequence lengths of shape `[N+1]` used for variable-length training,
+            consistent with the FlashAttention API.
+
+    Returns:
+        o (torch.Tensor):
+            Outputs of shape `[B, T, HQ, V]`.
+    """
+
+    assert block_counts is not None, "block counts must be provided for selection"
+    if scale is None:
+        scale = k.shape[-1] ** -0.5
+    if cu_seqlens is not None:
+        assert q.shape[0] == 1, "batch size must be 1 when cu_seqlens are provided"
+    # NOTE: note this! 
+    assert q.shape[2] % (k.shape[2] * 16) == 0, "Group size must be a multiple of 16 in NSA"
+
+    k_cmp, v_cmp = mean_pooling(k, block_size, cu_seqlens), mean_pooling(v, block_size, cu_seqlens)
+
+    o_cmp, lse_cmp = None, None
+
+    if g_cmp is not None:
+        o_cmp, lse_cmp = nsa_compression(
+            q=q,
+            k=k,
+            v=v,
+            block_size=block_size,
+            scale=scale,
+            cu_seqlens=cu_seqlens
+        )
+        if block_indices is not None:
+            import warnings
+            warnings.warn("`block_indices` will be ignored when `g_cmp` is provided")
+        
+        block_indices = nsa_topk(
+            q=q,
+            k=k_cmp,
+            lse=lse_cmp,
+            block_counts=block_counts,
+            block_size=block_size,
+            scale=scale,
+            cu_seqlens=cu_seqlens
+        )
+    
+    o = o_slc = nsa_selection(
+        q=q,
+        k=k,
+        v=v,
+        block_indices=block_indices,
+        block_counts=block_counts,
+        block_size=block_size,
+        scale=scale,
+        cu_seqlens=cu_seqlens
+    )
+
+    if g_slc is not None:
+        o = o_slc * g_slc.unsqueeze(-1)
+    
+    if g_cmp is not None:
+        o = torch.addcmul(o, o_cmp, g_cmp.unsqueeze(-1))
+    
+    if window_size > 0:
+        if cu_seqlens is not None:
+            max_seqlen = q.shape[1]
+            o_swa = flash_attn_varlen_func(
+                q.squeeze(0), k.squeeze(0), v.squeeze(0),
+                cu_seqlens_q=cu_seqlens,
+                cu_seqlens_k=cu_seqlens,
+                max_seqlen_q=max_seqlen,
+                max_seqlen_k=max_seqlen,
+                causal=True,
+                window_size=(window_size-1, 0),
+            ).unsqueeze(0)
+        else:
+            o_swa = flash_attn_func(
+                q, k, v,
+                causal=True,
+                window_size=(window_size-1, 0),
+            )
+        o = torch.addcmul(o, o_swa, g_swa.unsqueeze(-1))
+    return o
