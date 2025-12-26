@@ -308,7 +308,7 @@ my_softplus = SoftPlusFunction.apply
 
 # we use tanh to approximate for gelu
 @triton.jit
-def gelu_fwd_kernel(
+def gelu_tanh_approx_fwd_kernel(
     x,
     y,
     T: tl.constexpr,
@@ -326,7 +326,7 @@ def gelu_fwd_kernel(
     tl.store(y + o, b_y, o < T)
 
 @triton.jit
-def gelu_bwd_kernel(
+def gelu_tanh_approx_bwd_kernel(
     x,
     dx,
     dy,
@@ -349,46 +349,109 @@ def gelu_bwd_kernel(
     tl.store(dx + o, b_dx, o < T)
 
 
+@triton.jit
+def gelu_fwd_kernel(
+    x,
+    y,
+    T: tl.constexpr,
+    D: tl.constexpr,
+):
+    i_t = tl.program_id(0)
+    o = tl.arange(0, D) + i_t * D
+    b_x = tl.load(x + o, o < T)
+
+    c = 0.7071067812 # 1 / sqrt(2)
+
+    b_y = b_x * (0.5 * (1 + tl.erf(b_x * c)))
+    tl.store(y + o, b_y.to(y.dtype.element_ty), o < T)
+
+@triton.jit
+def gelu_bwd_kernel(
+    x,
+    dx,
+    dy,
+    T: tl.constexpr,
+    D: tl.constexpr,
+):
+    i_t = tl.program_id(0)
+    o = tl.arange(0, D) + i_t * D
+    b_x = tl.load(x + o, o < T)
+    b_dy = tl.load(dy + o, o < T)
+
+    c1 = 0.7071067812 # 1 / sqrt(2)
+    c2 = 0.3989422804 # 1 / sqrt(2 * pi)
+
+    b_t1 = (0.5 * (1 + tl.erf(b_x * c1)))
+    b_t2 = b_x * (c2 * tl.exp(-0.5 * b_x * b_x))
+    b_dx = b_dy * (b_t1 + b_t2)
+    tl.store(dx + o, b_dx.to(dx.dtype.element_ty), o < T)
+
+
 def gelu_fwd(
-    x: torch.Tensor
+    x: torch.Tensor,
+    approximate="none"
 ):
     T = x.numel()
     D = min(32, max(16, triton.next_power_of_2(T)))
     y = torch.empty_like(x)
-    gelu_fwd_kernel[(triton.cdiv(T, D),)](
-        x=x,
-        y=y,
-        T=T,
-        D=D
-    )
+    if approximate == "tanh":
+        gelu_tanh_approx_fwd_kernel[(triton.cdiv(T, D),)](
+            x=x,
+            y=y,
+            T=T,
+            D=D
+        )
+    elif approximate == "none":
+        # exact gelu using erf
+        gelu_fwd_kernel[(triton.cdiv(T, D),)](
+            x=x,
+            y=y,
+            T=T,
+            D=D
+        )
+    else:
+        raise NotImplementedError(f"GELU forward approximate method {approximate} not implemented")
     return y
 
 def gelu_bwd(
     x: torch.Tensor,
     dy: torch.Tensor,
+    approximate="none"
 ):
     T = x.numel()
     D = min(32, max(16, triton.next_power_of_2(T)))
     dx = torch.empty_like(x)
-    gelu_bwd_kernel[(triton.cdiv(T, D),)](
-        x=x,
-        dx=dx,
-        dy=dy,
-        T=T,
-        D=D
-    )
+    if approximate == "none":
+        gelu_bwd_kernel[(triton.cdiv(T, D),)](
+            x=x,
+            dx=dx,
+            dy=dy,
+            T=T,
+            D=D
+        )
+    elif approximate == "tanh":
+        gelu_tanh_approx_bwd_kernel[(triton.cdiv(T, D),)](
+            x=x,
+            dx=dx,
+            dy=dy,
+            T=T,
+            D=D
+        )
+    else:
+        raise NotImplementedError(f"GELU backward approximate method {approximate} not implemented")
     return dx
 
 class GELUFunction(torch.autograd.Function):
 
     @staticmethod
-    def forward(ctx, x):
+    def forward(ctx, x, approximate="none"):
         ctx.save_for_backward(x)
-        return gelu_fwd(x)
+        ctx.approximate = approximate
+        return gelu_fwd(x, approximate=approximate)
 
     @staticmethod
     def backward(ctx, dy):
         x, = ctx.saved_tensors
-        return gelu_bwd(x, dy)
+        return gelu_bwd(x, dy, approximate=ctx.approximate)
 
 my_gelu = GELUFunction.apply

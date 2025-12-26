@@ -1,14 +1,12 @@
 import torch
 import torch.nn.functional as F
 from activations import my_relu, my_sigmoid, my_swish, my_softplus, my_gelu
+from fla.ops.utils import mean_pooling
 
 def test_activation(fn_triton, fn_torch, name):
     x = torch.randn(1000, device='cuda' if torch.cuda.is_available() else 'cpu', dtype=torch.float32, requires_grad=True)
     y_triton = fn_triton(x)
-    if fn_torch is F.gelu:
-        y_torch = fn_torch(x, approximate="tanh")
-    else:
-        y_torch = fn_torch(x)
+    y_torch = fn_torch(x)
 
     forward_diff = (y_triton - y_torch).abs().max().item()
     print(f"{name} forward diff: {forward_diff}")
