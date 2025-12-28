@@ -31,4 +31,35 @@ def mean_pooling_fwd_kernel(
     b_y = tl.sum(b_x, axis=0) / min(BT, T - i_nt * BT)
 
     tl.store(p_y, b_y.to(p_y.dtype.element_ty), boundary_check=(0,))
+
+@triton.jit(do_not_specialize=['T'])
+def mean_pooling_bwd_kernel(
+    dy,
+    dx,
+    cu_seqlens, # varlen
+    chunk_iundices, # varlen
+    T,
+    H: tl.constexpr,
+    D: tl.constexpr,
+    BT: tl.constexpr,
+    BD: tl.constexpr,
+    IS_VARLEN: tl.constexpr
+):
+    i_d, i_nt, i_bh = tl.program_id(0), tl.program_id(1), tl.program_id(2)
+    i_b, i_h = i_bh // H, i_bh % H
+
+    NT = tl.cdiv(T, BT)
+
+    bos = i_b * T
+    bos_n = i_b * NT
+
+    p_dx = tl.make_block_ptr(dx + (bos * H + i_h) * D, (T, D), (H * D, 1), (i_nt * BT, i_d * BD), (BT, BD), (1, 0))
+    p_dy = tl.make_block_ptr(dy + ((bos_n + i_nt) * H + i_h) * D, (D,), (1,), (i_d * BD,), (BD,), (0,))
+
+    b_dy = tl.load(p_dy, boundary_check=(0,))
+
+    b_dx = b_dy / tl.full([BT], min(BT, T - i_nt * BT), dtype=tl.float32)[:, None] # [BT, BD]
+    tl.store(p_dx, b_dx.to(p_dx.dtype.element_ty), boundary_check=(0,1))
     
+
+
