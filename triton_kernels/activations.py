@@ -320,7 +320,7 @@ def gelu_tanh_approx_fwd_kernel(
     c = 0.044715
     a = 0.7978845608
     b_u = a * (b_x + c * b_x * b_x * b_x)
-    # tanh
+    # tanh NOTE: numerial stability here
     b_tanh_u = tl.where(b_u >= 0, (1 - 2 / (1 + tl.exp(2 * b_u))), (2 / (1 + tl.exp(-2 * b_u)) - 1)) 
     b_y = 0.5 * b_x * (1 + b_tanh_u)
     tl.store(y + o, b_y, o < T)

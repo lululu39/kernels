@@ -9,78 +9,25 @@ except ImportError:
     flash_attn_varlen_func = None
     flash_attn_func = None
 
-mean_pooling = None
-
-@triton.heuristics({
-    'USE_OFFSETS': lambda args: args['offsets'] is not None
-})
-
+from .pooling import my_mean_pooling
+from .sort import _bitonic_merge, _compare_and_swap # NOTE: we must import rather than directly copy to this file to avoid compilation error
 # NOTE: in nsa, the BT in fa2 is now from BT to G (query head group) at the same i_t
 # so you could also say that BT=1, but we add on another dimension which is G into consideration
 
 # NOTE: dimensions offsets that are not used in block ptr offsets are then used on the base pointer
 
-@triton.jit
-def _compare_and_swap(
-    x,
-    ids,
-    flip,
-    i: tl.constexpr,
-    n_dims: tl.constexpr,
-):
-    n_outer: tl.constexpr = x.numel >> n_dims
-    shape: tl.constexpr = [n_outer * 2**i, 2, 2**(n_dims - i - 1)]
-    y = tl.reshape(x, shape)
-    # slice left/right with 'stride' 2**(n_dims - i - 1)
-    mask = tl.arange(0, 2)[None, :, None]
-    left = tl.broadcast_to(tl.sum(y * (1 - mask), 1)[:, None, :], shape).to(y.dtype)
-    right = tl.broadcast_to(tl.sum(y * mask, 1)[:, None, :], shape).to(y.dtype)
-    left = tl.reshape(left, x.shape)
-    right = tl.reshape(right, x.shape)
-    # idx
-    y_idx = tl.reshape(ids, shape)
-    left_idx = tl.broadcast_to(tl.sum(y_idx * (1 - mask), 1)[:, None, :], shape)
-    right_idx = tl.broadcast_to(tl.sum(y_idx * mask, 1)[:, None, :], shape)
-    left_idx = tl.reshape(left_idx, x.shape).to(y_idx.dtype)
-    right_idx = tl.reshape(right_idx, x.shape).to(y_idx.dtype)
-    # actual compare-and-swap
-    idtype = tl.core.get_int_dtype(bitwidth=x.dtype.primitive_bitwidth, signed=True)
-    ileft = left.to(idtype, bitcast=True)
-    iright = right.to(idtype, bitcast=True)
-    ix = x.to(idtype, bitcast=True)
 
-    cond = (left > right) != flip
-    ret = ix ^ tl.where(cond, ileft ^ iright, tl.zeros_like(ix))
-    new_ids = ids ^ tl.where(cond, left_idx ^ right_idx, tl.zeros_like(ids))
-    return ret.to(x.dtype, bitcast=True), new_ids
-
-
-@triton.jit
-def _bitonic_merge(
-    x,
-    ids,
-    stage: tl.constexpr,
-    order: tl.constexpr,
-    n_dims: tl.constexpr,
-):
-    n_outer: tl.constexpr = x.numel >> n_dims
-    tl.static_assert(stage <= n_dims)
-    # flip denotes whether to re-arrange sub-sequences of elements in ascending or
-    # descending order.
-    # if flip = 00000000... then all elements will be re-arranged ascendingly at this stage
-    # if flip = 00110011... then all the elements will be re-arranged alternatingly (with
-    # a stride of 2) at this stage
-    if order == 2:
-        shape: tl.constexpr = [n_outer * 2**(n_dims - 1 - stage), 2, 2**stage]
-        flip = tl.reshape(tl.broadcast_to(tl.arange(0, 2)[None, :, None], shape), x.shape)
-    else:
-        flip = order
-    # perform `stage` rounds of `compare-and-swap`
-    for i in tl.static_range(stage):
-        x, ids = _compare_and_swap(x, ids, flip, i + (n_dims - stage), n_dims)
-    return x, ids
-
-
+# NOTE: this configuration is important! I copied from fla
+@triton.heuristics({
+    'IS_VARLEN': lambda args: args['cu_seqlens'] is not None
+})
+@triton.autotune(
+    configs=[
+        triton.Config({}, num_warps=num_warps)
+        for num_warps in [1, 2, 4]
+    ],
+    key=['BS', 'BK', 'BV'],
+)
 @triton.jit
 def nsa_compression_fwd_kernel(
     q,
@@ -121,7 +68,7 @@ def nsa_compression_fwd_kernel(
 
     # use base to aceess last two dims block
 
-    p_q = tl.make_block_ptr(p + (bos + i_t) * HQ * K, (HQ, K), (K, 1), (i_h * G, 0), (G, BK), (1, 0))
+    p_q = tl.make_block_ptr(q + (bos + i_t) * HQ * K, (HQ, K), (K, 1), (i_h * G, 0), (G, BK), (1, 0))
 
     p_o = tl.make_block_ptr(o + (bos + i_t) * HQ * V, (HQ, V), (V, 1), (i_h * G, i_v * BV), (G, BV), (1, 0))
 
@@ -173,7 +120,16 @@ def nsa_compression_fwd_kernel(
         # we only store once the lse
         tl.store(lse + (bos + i_t) * HQ + i_h * G + tl.arange(0, G), b_lse.to(lse.dtype.element_ty))
 
-
+@triton.heuristics({
+    'IS_VARLEN': lambda args: args['cu_seqlens'] is not None,
+})
+@triton.autotune(
+    configs=[
+        triton.Config({}, num_warps=num_warps)
+        for num_warps in [1, 2, 4]
+    ],
+    key=['BS', 'BK', 'BV'],
+)
 @triton.jit
 def nsa_compression_bwd_kernel_dq(
     q,
@@ -231,7 +187,7 @@ def nsa_compression_bwd_kernel_dq(
 
     p_do = tl.make_block_ptr(do, (HQ, V), (V, 1), (i_h * G, i_v * BV), (G, BV), (1, 0))
     p_lse = tl.make_block_ptr(lse, (HQ,), (1,), (i_h * G,), (G,), (0,))
-    p_delta = tl.make_block_ptr(delta, (HQ,), (q,), (i_h * G,), (G,), (0,))
+    p_delta = tl.make_block_ptr(delta, (HQ,), (1,), (i_h * G,), (G,), (0,))
 
     b_do = tl.load(p_do, boundary_check=(0,1)) # [G, BV]
     b_q = tl.load(p_q, boundary_check=(0,1))
@@ -268,7 +224,16 @@ def nsa_compression_bwd_kernel_dq(
 
     tl.store(p_dq, b_dq.to(p_dq.dtype.element_ty), boundary_check=(0,1))
 
-
+@triton.heuristics({
+    'IS_VARLEN': lambda args: args['cu_seqlens'] is not None
+})
+@triton.autotune(
+    configs=[
+        triton.Config({}, num_warps=num_warps)
+        for num_warps in [1, 2, 4]
+    ],
+    key=['BS', 'BK', 'BV'],
+)
 @triton.jit
 def nsa_compression_bwd_kernel_dkv(
     q,
@@ -314,7 +279,6 @@ def nsa_compression_bwd_kernel_dkv(
     i_b, i_h = i_bh // H, i_bh % H # NOTE: why not HQ as in FA2? because we are dealing with all HQ query heads (they share the same KV heads) in a single block
 
     TC = tl.cdiv(T, BS) # total blocks in original sequence
-    NC = (i_t + 1) // BS # how many valid blocks for a query group at position i_t
 
     bos, eos = i_b * T, (i_b + 1) * T
     boc = i_b * TC
@@ -341,6 +305,7 @@ def nsa_compression_bwd_kernel_dkv(
 
         # for q, we deal with one row at a time, but with G heads
         o_c = tl.arange(0, BC) + i_c * BC
+        NC = (i_t + 1) // BS # how many valid blocks for a query group at position i_t
 
         p_q = tl.make_block_ptr(q + (bos + i_t) * HQ * K, (HQ, K), (K, 1), (i_h * G, 0), (G, BK), (1, 0))
         p_do = tl.make_block_ptr(do + (bos + i_t) * HQ * V, (HQ, V), (V, 1), (i_h * G, i_v * BV), (G, BV), (1,0))
@@ -373,7 +338,17 @@ def nsa_compression_bwd_kernel_dkv(
     tl.store(p_dk, b_dk.to(p_dk.dtype.element_ty), boundary_check=(0,1))
     tl.store(p_dv, b_dv.to(p_dv.dtype.element_ty), boundary_check=(0,1))
 
-
+@triton.heuristics({
+    'IS_VARLEN': lambda args: args['cu_seqlens'] is not None
+})
+@triton.autotune(
+    configs=[
+        triton.Config({}, num_warps=num_warps)
+        for num_warps in [1, 2, 4]
+    ],
+    key=['BS', 'BK'],
+)
+@triton.jit
 def nsa_topk_kernel(
     q,
     k,
@@ -384,7 +359,6 @@ def nsa_topk_kernel(
     token_indices,
     chunk_offsets,
     T,
-    B: tl.constexpr,
     H: tl.constexpr,
     HQ: tl.constexpr,
     G: tl.constexpr, # NOTE: groups of query sharing the same KV set, this is a must because NSA use GQA
@@ -421,8 +395,9 @@ def nsa_topk_kernel(
     b_lse = tl.load(p_lse, boundary_check=(0,)) # NOTE: we assume the lse is returned in compression, so we do not recompute
 
     # NOTE: the first half of b_i always descends and second half always ascends if we are updating
-    b_i = tl.zeros([BC], dtype=tl.float32) # [BC], where BC >= 2 * S because we are going to use bitonic merge to sort top-k
-    o_i = tl.zeros([BC], dtype=tl.float32)
+    # NOTE: set to -1 to indicate invalid index
+    b_i = tl.full([BC], -1, dtype=tl.float32) # [BC], where BC >= 2 * S because we are going to use bitonic merge to sort top-k
+    o_i = tl.zeros([BC], dtype=tl.int32) # NOTE: use int
     m_i = tl.arange(0, BC) < (BC // 2)
 
     for i_c in tl.range(0, NC, BC):
@@ -486,6 +461,17 @@ def nsa_topk_kernel(
     tl.store(p_b, b_top.to(p_b.dtype.element_ty))
 
 
+@triton.heuristics({
+    'IS_VARLEN': lambda args: args['cu_seqlens'] is not None,
+    'USE_BLOCK_COUNTS': lambda args: isinstance(args['block_counts'], torch.Tensor),
+})
+@triton.autotune(
+    configs=[
+        triton.Config({}, num_warps=num_warps)
+        for num_warps in [1, 2, 4]
+    ],
+    key=['BS', 'BK', 'BV'],
+)
 @triton.jit
 def nsa_selection_fwd_kernel(
     q,
@@ -548,7 +534,7 @@ def nsa_selection_fwd_kernel(
 
         i_s = tl.load(block_indices + i).to(tl.int32) * BS # the true offsets for selected k and v block
 
-        if i_s <= i_t & i_s >= 0:
+        if i_s <= i_t and i_s >= 0: # NOTE: use and, no &
             # ensure causality
             o_s = i_s + tl.arange(0, BS) # dont know if this is requireed, since we do not select incploete block
             # NOTE: but one scnatios may be that S is larger than num of valid blocks, so we inevetbly choose some invalid block
@@ -579,11 +565,22 @@ def nsa_selection_fwd_kernel(
     
     b_o = b_o / b_acc[:, None]
     b_m += tl.log(b_acc)
-    tl.store(lse, b_m.to(p_lse.dtype.element_ty), boundary_check=(0,))
+    tl.store(p_lse, b_m.to(p_lse.dtype.element_ty), boundary_check=(0,))
     tl.store(p_o, b_o.to(p_o.dtype.element_ty), boundary_check=(0,1))
 
 
-@triton.jit
+@triton.heuristics({
+    'IS_VARLEN': lambda args: args['cu_seqlens'] is not None,
+    'USE_BLOCK_COUNTS': lambda args: isinstance(args['block_counts'], torch.Tensor)
+})
+@triton.autotune(
+    configs=[
+        triton.Config({}, num_warps=num_warps)
+        for num_warps in [1, 2, 4]
+    ],
+    key=['BS', 'BK', 'BV'],
+)
+@triton.jit(do_not_specialize=['T'])
 def nsa_selection_bwd_kernel_dq(
     q,
     k,
@@ -632,7 +629,7 @@ def nsa_selection_bwd_kernel_dq(
 
     b_q = tl.load(p_q, boundary_check=(0,1))
 
-    b_do = tl.load(b_do, boundary_check=(0,1))
+    b_do = tl.load(p_do, boundary_check=(0,1))
 
     b_lse = tl.load(p_lse, boundary_check=(0,))
 
@@ -648,7 +645,7 @@ def nsa_selection_bwd_kernel_dq(
         i_s = tl.load(block_indices + i).to(tl.int32) * BS # the true offsets for selected k and v block
 
         # NOTE: i_s is suppoedd to be always less than 
-        if i_s >= 0 & i_s <= i_t:
+        if i_s >= 0 and i_s <= i_t:
 
             o_s = tl.arange(0, BS) + i_s
 
@@ -675,16 +672,21 @@ def nsa_selection_bwd_kernel_dq(
 
     tl.store(p_dq, b_dq.to(p_dq.dtype.element_ty), boundary_check=(0,1))
 
-@triton.jit
+
+@triton.heuristics({
+    'USE_BLOCK_COUNTS': lambda args: isinstance(args['block_counts'], torch.Tensor)
+})
+@triton.jit(do_not_specialize=['T'])
 def nsa_selection_kernel_block_mask(
     block_indices,
     block_counts,
     block_mask,
     H: tl.constexpr,
     S: tl.constexpr,
-    T: tl.constexpr,
+    T, # NOTE: do not use tl.contextptr fotr T, otherwise compilation error
     BS: tl.constexpr,
     NS: tl.constexpr,
+    USE_BLOCK_COUNTS: tl.constexpr # not used currently
 ):
     # not sure why NS = tl.cdiv(T, BS) is used, because block_indices shoulw not contain indices larger than NS
 
@@ -696,17 +698,24 @@ def nsa_selection_kernel_block_mask(
 
     bos = i_b * T
 
-    p_i = tl.make_block_ptr(block_indices + ((bos + i_t) * H + i_h) * S, (S,), (1,), (i_s,), (1,), (0,))
+    b_i = tl.load(block_indices + ((bos + i_t) * H + i_h) * S + i_s) # NOTE: use scalar load!
 
-    b_i = tl.load(p_i, boundary_check=(0,))
+    b_m = ((b_i < (i_t + 1) // BS) and (b_i >= 0)) # again, first part is not required since we did this in top-k kernel and set invalid indices to -1
 
-    b_m = ((b_i < (i_t + 1) // BS) & (b_i >= 0)) # again, first part is not required since we did this in top-k kernel and set invalid indices to -1
-
-    if b_i < NS & b_i >= 0:
+    if b_i < NS and b_i >= 0:
         tl.store(block_mask + ((bos + i_t) * H + i_h) * NS + b_i, b_m.to(block_mask.dtype.element_ty))
     
-
-@triton.jit
+@triton.heuristics({
+    'IS_VARLEN': lambda args: args['cu_seqlens'] is not None
+})
+@triton.autotune(
+    configs=[
+        triton.Config({}, num_warps=num_warps)
+        for num_warps in [1, 2, 4]
+    ],
+    key=['BS', 'BK', 'BV'],
+)
+@triton.jit(do_not_specialize=['T'])
 def nsa_selection_bwd_kernel_dkv(
     q,
     k,
@@ -717,9 +726,7 @@ def nsa_selection_bwd_kernel_dkv(
     dk,
     dv,
     scale,
-    block_indices, # indices of selected blocks
-    block_counts, # how many blocks each query chooses, can be less than S
-    block_mask,
+    block_mask, # use this instaed of online computing a block is valid or not
     cu_seqlens, # varlen
     chunk_indices, # varlen
     T,
@@ -730,7 +737,6 @@ def nsa_selection_bwd_kernel_dkv(
     G: tl.constexpr, # NOTE: groups of query sharing the same KV set, this is a must because NSA use GQA
     K: tl.constexpr,
     V: tl.constexpr,
-    S: tl.constexpr, # number of seletced block (max value)
     BS: tl.constexpr, # block size of compression
     BK: tl.constexpr,
     BV: tl.constexpr,
@@ -759,10 +765,10 @@ def nsa_selection_bwd_kernel_dkv(
     b_k = tl.load(p_k, boundary_check=(0,1)) # [BS, BK]
     b_v = tl.load(p_v, boundary_check=(0,1)) # [BS, BV]
 
-    p_dk = tl.zeros([BS, BK], dtype=tl.float32)
-    p_dv = tl.zeros([BS, BV], dtype=tl.float32)
+    b_dk = tl.zeros([BS, BK], dtype=tl.float32)
+    b_dv = tl.zeros([BS, BV], dtype=tl.float32)
 
-    o_s = tl.arange(0, BS) + i_S * BS
+    o_s = tl.arange(0, BS) + i_s * BS
 
     for i in tl.range(i_s * BS, T):
         b_m = tl.load(block_mask + (bos + i) * H * M + i_h * M + i_s)
@@ -776,7 +782,7 @@ def nsa_selection_bwd_kernel_dkv(
 
             b_q = tl.load(p_q, boundary_check=(0,1)) # [G, BK]
             b_lse = tl.load(p_lse, boundary_check=(0,)) # [G,]
-            b_delta = tl.load(p_delta, boundary_check=(0,1)) # [G,]
+            b_delta = tl.load(p_delta, boundary_check=(0,)) # [G,]
             b_do = tl.load(p_do, boundary_check=(0,1)) # [G, BV]
 
             b_s = tl.dot(b_k, tl.trans(b_q)) # [BS, G]
@@ -876,7 +882,7 @@ def nsa_compression_bwd(
 
     assert NK == 1, "The key dimension can not be larger than 256"
 
-    from fa2 import flash_attention_2_bwd_preprocess as preprocess
+    from .fa2 import flash_attention_2_bwd_preprocess as preprocess
 
     delta = preprocess(o, do)
 
@@ -980,7 +986,8 @@ class NSACompressionFunction(torch.autograd.Function):
     @staticmethod
     @contiguous
     @autocast_custom_bwd
-    def backward(ctx, do):
+    def backward(ctx, do, *args):
+        # NOTE: the args here is because we return lse as well
         q, k, v, o, lse = ctx.saved_tensors
         dq, dk, dv = nsa_compression_bwd(
             q=q,
@@ -1030,7 +1037,7 @@ def nsa_selection_fwd(
     token_indices: torch.LongTensor | None = None, # used for varlen
 ):
     
-    B, T, HQ, K, H, V, S = *q.shape, K.shape[-2], v.shape[-1], block_indices.shape[-1]
+    B, T, HQ, K, H, V, S = *q.shape, k.shape[-2], v.shape[-1], block_indices.shape[-1]
     G = HQ // H
     BS = block_size
 
@@ -1106,7 +1113,7 @@ def nsa_selection_bwd(
     cu_seqlens: torch.LongTensor | None = None,
     token_indices: torch.LongTensor | None = None, # used for varlen 
 ):
-    B, T, HQ, K, H, V, S = *q.shape, K.shape[-2], v.shape[-1], block_indices.shape[-1]
+    B, T, HQ, K, H, V, S = *q.shape, k.shape[-2], v.shape[-1], block_indices.shape[-1]
     G = HQ // H
     BS = block_size
     BK = max(triton.next_power_of_2(K), 16)
@@ -1116,7 +1123,7 @@ def nsa_selection_bwd(
     
     NS = triton.cdiv(T, BS) # used for dkv kernel
 
-    from fa2 import flash_attention_2_bwd_preprocess as preprocess
+    from .fa2 import flash_attention_2_bwd_preprocess as preprocess
 
     delta = preprocess(o, do)
 
@@ -1227,7 +1234,7 @@ class NSASelectionFunction(torch.autograd.Function):
     @autocast_custom_bwd
     def backward(ctx, do):
         q, k, v, o, lse = ctx.saved_tensors
-        dq, dk, dv = nsa_compression_bwd(
+        dq, dk, dv = nsa_selection_bwd(
             q=q,
             k=k,
             v=v,
@@ -1278,7 +1285,7 @@ def nsa_topk(
     cu_seqlens: torch.LongTensor | None = None
 ):
     B, T, HQ, K, H = *q.shape, k.shape[-2]
-    G = HQ // K
+    G = HQ // H
     S = block_counts if isinstance(block_counts, int) else block_counts.max().item()
     S = triton.next_power_of_2(S) # NOTE: triton requires us to do so
     BC = BS = block_size
@@ -1379,15 +1386,15 @@ def native_sparse_attention(
     # NOTE: note this! 
     assert q.shape[2] % (k.shape[2] * 16) == 0, "Group size must be a multiple of 16 in NSA"
 
-    k_cmp, v_cmp = mean_pooling(k, block_size, cu_seqlens), mean_pooling(v, block_size, cu_seqlens)
+    k_cmp, v_cmp = my_mean_pooling(k, block_size, cu_seqlens), my_mean_pooling(v, block_size, cu_seqlens)
 
     o_cmp, lse_cmp = None, None
 
     if g_cmp is not None:
         o_cmp, lse_cmp = nsa_compression(
             q=q,
-            k=k,
-            v=v,
+            k=k_cmp,
+            v=v_cmp, # NOTE!!!!!!!!!!!!!!
             block_size=block_size,
             scale=scale,
             cu_seqlens=cu_seqlens
