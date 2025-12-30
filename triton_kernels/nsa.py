@@ -9,8 +9,10 @@ except ImportError:
     flash_attn_varlen_func = None
     flash_attn_func = None
 
-from .pooling import my_mean_pooling
-from .sort import _bitonic_merge, _compare_and_swap # NOTE: we must import rather than directly copy to this file to avoid compilation error
+from fa2 import flash_attention_2_bwd_preprocess as preprocess
+
+from pooling import my_mean_pooling
+from sort import _bitonic_merge, _compare_and_swap # NOTE: we must import rather than directly copy to this file to avoid compilation error
 # NOTE: in nsa, the BT in fa2 is now from BT to G (query head group) at the same i_t
 # so you could also say that BT=1, but we add on another dimension which is G into consideration
 
@@ -208,7 +210,7 @@ def nsa_compression_bwd_kernel_dq(
 
         b_v = tl.load(p_v, boundary_check=(0,1)) # [BV, BC]
 
-        b_s = tl.dot(b_q, b_k) # [G, BC]
+        b_s = tl.dot(b_q, b_k) * scale # [G, BC]
 
         b_p = tl.exp(b_s - b_lse[:, None]) # [G, BC]
 
@@ -234,7 +236,7 @@ def nsa_compression_bwd_kernel_dq(
     ],
     key=['BS', 'BK', 'BV'],
 )
-@triton.jit
+@triton.jit(do_not_specialize=['T'])
 def nsa_compression_bwd_kernel_dkv(
     q,
     k,
@@ -246,7 +248,7 @@ def nsa_compression_bwd_kernel_dkv(
     delta,
     scale,
     cu_seqlens, # varlen
-    token_indices, # varlen
+    chunk_indices, # varlen
     chunk_offsets, # varlen
     T,
     B: tl.constexpr,
@@ -305,11 +307,10 @@ def nsa_compression_bwd_kernel_dkv(
 
         # for q, we deal with one row at a time, but with G heads
         o_c = tl.arange(0, BC) + i_c * BC
-        NC = (i_t + 1) // BS # how many valid blocks for a query group at position i_t
 
         p_q = tl.make_block_ptr(q + (bos + i_t) * HQ * K, (HQ, K), (K, 1), (i_h * G, 0), (G, BK), (1, 0))
         p_do = tl.make_block_ptr(do + (bos + i_t) * HQ * V, (HQ, V), (V, 1), (i_h * G, i_v * BV), (G, BV), (1,0))
-        p_lse = tl.make_block_ptr(lse + (bos + i_h) * HQ, (HQ,), (1,), (i_h * G,), (G,), (0,))
+        p_lse = tl.make_block_ptr(lse + (bos + i_t) * HQ, (HQ,), (1,), (i_h * G,), (G,), (0,)) # NOTE: previously bug here
         p_delta = tl.make_block_ptr(delta + (bos + i_t) * HQ, (HQ,), (1,), (i_h * G,), (G,), (0,))
 
         b_q = tl.load(p_q, boundary_check=(0,1)) # [G, BK]
@@ -874,15 +875,10 @@ def nsa_compression_bwd(
     BK = max(triton.next_power_of_2(K), 16) # BK less than K
     BV = min(128, max(triton.next_power_of_2(v.shape[-1]), 16))
 
-    NK = triton.cdiv(K, BK)
     NV = triton.cdiv(V, BV)
 
     chunk_indices, chunk_offsets = None, None
     NC = triton.cdiv(triton.cdiv(T, BS), BC)
-
-    assert NK == 1, "The key dimension can not be larger than 256"
-
-    from .fa2 import flash_attention_2_bwd_preprocess as preprocess
 
     delta = preprocess(o, do)
 
@@ -920,7 +916,7 @@ def nsa_compression_bwd(
     dk = torch.empty(NV, *k.shape, dtype=k.dtype if NV == 1 else torch.float, device=q.device)
     dv = torch.empty(*v.shape, dtype=v.dtype, device=q.device)
 
-    grid = [NC, NV, B * H]
+    grid = (NC, NV, B * H)
 
     nsa_compression_bwd_kernel_dkv[grid](
         q=q,
@@ -933,8 +929,8 @@ def nsa_compression_bwd(
         delta=delta,
         scale=scale,
         cu_seqlens=cu_seqlens,
-        token_indices=token_indices,
-        chunk_offsets=chunk_indices,
+        chunk_indices=chunk_indices,
+        chunk_offsets=chunk_offsets,
         T=T,
         B=B,
         H=H,
@@ -952,7 +948,6 @@ def nsa_compression_bwd(
 
     return dq, dk, dv
 
-@torch.compile
 class NSACompressionFunction(torch.autograd.Function):
 
     @staticmethod
@@ -1001,14 +996,15 @@ class NSACompressionFunction(torch.autograd.Function):
             cu_seqlens=ctx.cu_seqlens,
             token_indices=ctx.token_indices,
         )
-        return dq.to(q), dk.to(k), dk.to(v), None, None, None
+
+        return dq.to(q), dk.to(k), dv.to(v), None, None, None
 
 
 def nsa_compression(
     q: torch.Tensor,
     k: torch.Tensor,
     v: torch.Tensor,
-    block_size: int,
+    block_size: int = 64,
     scale: float = None,
     cu_seqlens: torch.LongTensor | None = None,
 ):
