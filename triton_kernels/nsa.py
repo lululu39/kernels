@@ -9,10 +9,10 @@ except ImportError:
     flash_attn_varlen_func = None
     flash_attn_func = None
 
-from fa2 import flash_attention_2_bwd_preprocess as preprocess
+from .fa2 import flash_attention_2_bwd_preprocess as preprocess
 
-from pooling import my_mean_pooling
-from sort import _bitonic_merge, _compare_and_swap # NOTE: we must import rather than directly copy to this file to avoid compilation error
+from .pooling import my_mean_pooling
+from .sort import _bitonic_merge, _compare_and_swap # NOTE: we must import rather than directly copy to this file to avoid compilation error
 # NOTE: in nsa, the BT in fa2 is now from BT to G (query head group) at the same i_t
 # so you could also say that BT=1, but we add on another dimension which is G into consideration
 
