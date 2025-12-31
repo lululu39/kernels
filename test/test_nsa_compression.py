@@ -4,10 +4,12 @@ import pytest
 import torch
 import triton
 from triton_kernels.nsa import nsa_compression as tri_nsa
+from triton_kernels.nsa import nsa_topk as tri_topk
 from triton_kernels.pooling import my_mean_pooling
 
 try:
     from fla.ops.nsa.compression import parallel_nsa_compression as fla_nsa
+    from fla.ops.nsa.parallel import parallel_nsa_topk as fla_topk
     HAS_FLA = True
 except Exception:
     HAS_FLA = False
@@ -40,6 +42,7 @@ def test_nsa_compression_selection_equivalence(B: int, T: int, block_counts: int
     G = 16
     V = 64
     HQ = H * G
+    scale = K ** -0.5
 
     # create inputs
     q = torch.randn((B, T, HQ, K), dtype=torch.float16, device=device).requires_grad_(True)
@@ -61,6 +64,14 @@ def test_nsa_compression_selection_equivalence(B: int, T: int, block_counts: int
     tri_lse = tri[1]
     tri_dq, tri_dk, tri_dv = q1.grad, k1.grad, v1.grad
 
+    indices1 = tri_topk(
+        q=q1, k=k1,
+        lse=tri_lse,
+        block_counts=8,
+        block_size=64,
+        scale=scale
+    )
+
     q2, k2, v2 = q.clone().detach().requires_grad_(True), \
                 k.clone().detach().requires_grad_(True), \
                 v.clone().detach().requires_grad_(True)
@@ -68,6 +79,13 @@ def test_nsa_compression_selection_equivalence(B: int, T: int, block_counts: int
     ref = fla_nsa(q2, k2, v2)
     ref[0].backward(do)
     ref_lse = ref[1]
+    indices2 = fla_topk(
+        q=q2, k=k2, 
+        lse=ref_lse,
+        block_counts=8,
+        block_size=64,
+        scale=scale
+    )
     ref_dq, ref_dk, ref_dv = q2.grad, k2.grad, v2.grad
 
     assert_close("o", ref[0], tri[0], 0.005)
@@ -76,3 +94,7 @@ def test_nsa_compression_selection_equivalence(B: int, T: int, block_counts: int
 
     assert_close("dv", ref_dv, tri_dv, 0.005)
     assert_close("dk", ref_dk, tri_dk, 0.005)
+
+    # print differnce in indices
+    diff = (indices1 - indices2).abs().sum().item()
+    assert diff == 0, f"TopK indices differ by {diff} elements"

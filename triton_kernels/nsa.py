@@ -390,7 +390,7 @@ def nsa_topk_kernel(
     boc = i_b * TC
 
     p_q = tl.make_block_ptr(q + (bos + i_t) * HQ * K, (HQ, K), (K, 1), (i_h * G, 0), (G, BK), (1,0))
-    p_lse = tl.make_block_ptr(lse + (bos + i_t) * HQ, (HQ,), (1,), (i_h * G), (G,), (0,))
+    p_lse = tl.make_block_ptr(lse + (bos + i_t) * HQ, (HQ,), (1,), (i_h * G,), (G,), (0,))
 
     b_q = tl.load(p_q, boundary_check=(0,1))
     b_lse = tl.load(p_lse, boundary_check=(0,)) # NOTE: we assume the lse is returned in compression, so we do not recompute
@@ -401,7 +401,9 @@ def nsa_topk_kernel(
     o_i = tl.zeros([BC], dtype=tl.int32) # NOTE: use int
     m_i = tl.arange(0, BC) < (BC // 2)
 
-    for i_c in tl.range(0, NC, BC):
+    # NOTE: why cdiv? because incomplete block should also be considered.
+    # This is differnt from compression branch!
+    for i_c in tl.range(0, tl.cdiv(i_t + 1, BS), BC):
 
         # NOTE: here I use a difference iteration strategy
         # NOTE: offset <= offset, while offset < number, vice versa
@@ -429,7 +431,8 @@ def nsa_topk_kernel(
         # NOTE: difference
         # discard invalid block offsets
         # NOTE: this step is required!!!!
-        o_i, o_ip = tl.where(o_c < NC, o_c, -1), o_i
+        # NOTE: the incomplete block where current query token is located should be selected
+        o_i, o_ip = tl.where(o_c <= IC, o_c, -1), o_i
 
         n_dims: tl.constexpr = tl.standard._log2(BC)
 
