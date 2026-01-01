@@ -527,7 +527,7 @@ def nsa_selection_fwd_kernel(
 
     p_o = tl.make_block_ptr(o + (bos + i_t) * HQ * V, (HQ, V), (V, 1), (i_h * G, i_v * BV), (G, BV), (1, 0)) # [G, BV]
 
-    p_lse = tl.make_block_ptr(o + (bos + i_t) * HQ, (HQ,), (1,), (i_h * G,), (G,), (0,)) # [G]
+    p_lse = tl.make_block_ptr(lse + (bos + i_t) * HQ, (HQ,), (1,), (i_h * G,), (G,), (0,)) # [G]
 
     b_o = tl.zeros([G, BV], dtype=tl.float32)
 
@@ -543,7 +543,7 @@ def nsa_selection_fwd_kernel(
             o_s = i_s + tl.arange(0, BS) # dont know if this is requireed, since we do not select incploete block
             # NOTE: but one scnatios may be that S is larger than num of valid blocks, so we inevetbly choose some invalid block
 
-            p_k = tl.make_block_ptr(k, (K, T), (1, H * K), (0, i_s), (BV, BS), (0, 1))
+            p_k = tl.make_block_ptr(k, (K, T), (1, H * K), (0, i_s), (BK, BS), (0, 1))
 
             p_v = tl.make_block_ptr(v, (T, V), (H * V, 1), (i_s, i_v * BV), (BS, BV), (1,0))
 
@@ -565,7 +565,7 @@ def nsa_selection_fwd_kernel(
 
             b_acc = b_acc * b_r + tl.sum(b_p, 1)
 
-            b_o += tl.dot(b_p.to(b_v.dtype), b_v) # [G, BV]
+            b_o = b_o * b_r[:, None] + tl.dot(b_p.to(b_v.dtype), b_v) # [G, BV] NOTE: o need to be rescaled as well
     
     b_o = b_o / b_acc[:, None]
     b_m += tl.log(b_acc)
@@ -1046,8 +1046,10 @@ def nsa_selection_fwd(
     NK = triton.cdiv(K, BK)
     NV = triton.cdiv(V, BV)
 
-    lse = torch.empty(B, T, H, dtype=torch.float, device=q.device) # NOTE: use float
+    assert NK == 1, "The key dimension can not be larger than 256"
+
     o = torch.empty(B, T, HQ, V, dtype=v.dtype, device=q.device)
+    lse = torch.empty(B, T, HQ, dtype=torch.float, device=q.device) # NOTE: use float, and is of HQ!
 
     grid = (T, NV, B * H) # why T, because only one query position is processed in each block
     nsa_selection_fwd_kernel[grid](
