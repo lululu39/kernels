@@ -19,11 +19,11 @@ from fla.utils import assert_close, check_shared_mem, device
     ("B", "T", "block_counts"),
     [
         pytest.param(B, T, bc, id=f"B{B}-T{T}-block_counts{bc}")
-        for B in [1]
-        # for T in [512, 1024, 1317]
-        for T in [512]
-        # for bc in [8, 16]
-        for bc in [8]
+        for B in [1, 2]
+        for T in [512, 1024, 1317]
+        # for T in [512]
+        for bc in [8, 16]
+        # for bc in [8]
     ],
 )
 def test_nsa_compression_selection_equivalence(B: int, T: int, block_counts: int):
@@ -50,7 +50,7 @@ def test_nsa_compression_selection_equivalence(B: int, T: int, block_counts: int
 
     # gating masks to exercise compression and selection branches
     g_cmp = torch.randn((B, T, HQ), dtype=torch.float16, device=device)
-    g_slc = torch.zeros((B, T, HQ), dtype=torch.float16, device=device)
+    g_slc = torch.randn((B, T, HQ), dtype=torch.float16, device=device)
     # swa left as None as requested
     g_swa = None
 

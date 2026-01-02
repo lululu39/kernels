@@ -704,7 +704,9 @@ def nsa_selection_kernel_block_mask(
 
     b_i = tl.load(block_indices + ((bos + i_t) * H + i_h) * S + i_s) # NOTE: use scalar load!
 
-    b_m = ((b_i < (i_t + 1) // BS) and (b_i >= 0)) # again, first part is not required since we did this in top-k kernel and set invalid indices to -1
+    b_m = ((b_i <= i_t // BS) and (b_i >= 0)) # again, first part is not required since we did this in top-k kernel and set invalid indices to -1
+    # b_m = (b_i >= 0) # NOTE: this works as well!
+
 
     if b_i < NS and b_i >= 0:
         tl.store(block_mask + ((bos + i_t) * H + i_h) * NS + b_i, b_m.to(block_mask.dtype.element_ty))
@@ -789,7 +791,7 @@ def nsa_selection_bwd_kernel_dkv(
             b_delta = tl.load(p_delta, boundary_check=(0,)) # [G,]
             b_do = tl.load(p_do, boundary_check=(0,1)) # [G, BV]
 
-            b_s = tl.dot(b_k, tl.trans(b_q)) # [BS, G]
+            b_s = tl.dot(b_k, tl.trans(b_q)) * scale # [BS, G]
             b_p = tl.exp(b_s - b_lse[None, :])
             b_p = tl.where((o_s <= i)[:, None], b_p, 0)
             b_dp = tl.dot(b_v, tl.trans(b_do)) # [BS, G]
@@ -797,6 +799,8 @@ def nsa_selection_bwd_kernel_dkv(
 
             b_dv += tl.dot(b_p.to(b_do.dtype), b_do)
             b_dk += tl.dot(b_ds.to(b_q.dtype), b_q) # [BS, BK]
+    
+    b_dk *= scale
     
     tl.store(p_dk, b_dk.to(p_dk.dtype.element_ty), boundary_check=(0,1))
     tl.store(p_dv, b_dv.to(p_dv.dtype.element_ty), boundary_check=(0,1))

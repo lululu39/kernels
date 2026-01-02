@@ -67,7 +67,7 @@ def test_nsa_compression_selection_equivalence(B: int, T: int, block_counts: int
     indices1 = tri_topk(
         q=q1, k=k1,
         lse=tri_lse,
-        block_counts=8,
+        block_counts=16,
         block_size=64,
         scale=scale
     )
@@ -82,7 +82,7 @@ def test_nsa_compression_selection_equivalence(B: int, T: int, block_counts: int
     indices2 = fla_topk(
         q=q2, k=k2, 
         lse=ref_lse,
-        block_counts=8,
+        block_counts=16,
         block_size=64,
         scale=scale
     )
