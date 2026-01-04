@@ -62,6 +62,8 @@ def mixture_of_block_attention(
     T, HQ, D = q.shape
     H = k.shape[-2] 
 
+    assert HQ == H, "head of q must equal to k, GQA is not allowed in this version of MoBA"
+
     #  NOTE: why stack k and v, because the selection applies to them both
     kv = torch.stack((k, v), dim=1) # [T, 2, H, D]
 
@@ -85,7 +87,7 @@ def mixture_of_block_attention(
     )[None, :].repeat(num_filtered_chunk, 1) # [num_filtered_chunk, chunk_size]
     filtered_kv_indices += cu_chunk[filtered_chunk_indices][:, None] # we add the offset for each chunk
     filtered_kv = kv.index_select(0, filtered_kv_indices.view(-1)) # kv that only contains elements needs moba attn
-    # shape [num_filtered_chunk * chunk_size, H, K/V]
+    # shape [num_filtered_chunk * chunk_size, 2, H, D]
 
     # then we calculate the score for block selection
 
@@ -98,8 +100,8 @@ def mixture_of_block_attention(
     q = q.type(torch.float32)  # NOTE: use float for high-precision calculation
     pooled_k = pooled_k.type(torch.float32)
     score = torch.einsum(
-        "nhd,thd->tnh", pooled_k, q
-    )  # [N, T, H]
+        "nhd,thd->nht", pooled_k, q
+    )  # [N, H, T] NOTE: this is more convenient
     pooled_k = pooled_k.type_as(k)
     q = q.type_as(k)
 
@@ -107,11 +109,74 @@ def mixture_of_block_attention(
     score_seq_idx = torch.arange(0, T, device=q.device, dtype=torch.int32)[:, None].repeat(num_filtered_chunk, 1) # [N, T]
     chunk_end = cu_chunk[filtered_chunk_indices + 1] # end offset for each chunk [N]
     batch_end = cu_seqlens[chunk_to_batch[filtered_chunk_indices] + 1] # batch end offset for each chunk [N]
-    chunk_end_mask = score_seq_idx < chunk_end[:, None] # chunk position must precede query token
+    chunk_end_mask = score_seq_idx < chunk_end[:, None] # chunk end position must precede query token, because we are using complete blocks for moba
     batch_end_mask = score_seq_idx >= batch_end[:, None] # other batchs
-    score_mask = chunk_end_mask | batch_end_mask # [N, T]
-    score.masked_fill_(score_mask.unsqueeze(-1), -float("inf")) # [N, T, H]
+    score_inf_mask = chunk_end_mask | batch_end_mask # [N, T]
+    score.masked_fill_(score_inf_mask.unsqueeze(1), -float("inf")) # [N, H, T]
+
+    # find topk blocks and set a mask representing them
+
+    _, score_top_k_idx = torch.topk(score, k=topk, dim=0, largest=True, sorted=False) # [topk, H, T]
+
+    score_mask = torch.logical_not(score.isinf())
+    score_idx_mask = torch.zeros(score.shap, dtype=torch.bool, device=q.device)
+    score_idx_mask = score_idx_mask.scatter_(dim=0, index=score_top_k_idx, value=True)
+    score_mask = score_mask & score_idx_mask # [N, H, T]
+
+    # NOTE: the result will be like [ C0H0 ][ C0H1 ][ C0H2 ][ ... ][ CnHm ]
+    # NOTE: 这里q indices用H * T，方便下面的moba_q计算
+    moba_q_indices = score_mask.reshape(score_mask.shape[0], -1).nonzero(as_tuple=True)[-1] # [chunk1 selected idx, chun2 selected idx, xxx]
+    moba_seqlen_q = score_mask.sum(dim=-1).flatten() # [N * H] query seqlen of each kv chunk
+
+    moba_q = rearrange(q, "t h d -> ( h t ) d").index_select(
+        0, moba_q_indices
+    )  # [ S, D ] NOTE: S is chunk1 selected + chunk2 + ...
+    moba_q = moba_q.unsqueeze(1) # [S, 1, D]
+    # moba_q_th_indices represents the position in the origin q tensor (flattend T* H ) of each q token inside moba_q
+    moba_q_th_indices = moba_q_indices % T * HQ + moba_q_indices // T
+
+    q_zero_mask = moba_seqlen_q == 0 # [N * H]
+    valid_expert_mask = ~q_zero_mask # here expert means the kv blocks
+    zero_expert_count = q_zero_mask.sum()
+
+    if zero_expert_count > 0:
+        # only keep kv blocks that had query chosen
+        moba_seqlen_q = moba_seqlen_q[valid_expert_mask] # [C]
+    
+    moba_cu_seqlen_q = torch.cat((
+            torch.tensor([0], device=q.device, dtype=moba_seqlen_q.dtype),
+            moba_seqlen_q.cumsum(dim=0),),dim=0).to(torch.int32)
+
+    moba_kv = rearrange(filtered_kv, "s x h d -> h s x d")
+    moba_kv = moba_kv.split(chunk_size, dim=1)
+    moba_kv = torch.cat(moba_kv, dim=0) # [N * H, chunk_size, 2, D]
+
+    if zero_expert_count > 0:
+        assert valid_expert_mask.sum() == moba_kv.shape[0] - zero_expert_count
+        moba_kv = moba_kv[valid_expert_mask]  # cut off zero Q expert from kv , or the grad may be nan
+        # shape [C * H, chunk_size, 2, D]
+    
+    moba_kv = moba_kv.flatten(start_dim=0, end_dim=1).unsqueeze(2) # [C * H * chunk_size, 2, 1, D]
+
+    moba_cu_seqlen_kv = (
+        torch.arange(
+            0,
+            # num_filtered_chunk * H + 1 - zero_expert_count,
+            int(valid_expert_mask.sum().item()) + 1,
+            dtype=torch.int32,
+            device=q.device,
+        )
+        * chunk_size
+    ) # in the order of chunk-head
+
+    # NOTE: all is the ordering of chunk-head pair
+    assert (
+        moba_cu_seqlen_kv.shape == moba_cu_seqlen_q.shape
+    ), f"moba_cu_seqlen_kv.shape != moba_cu_seqlen_q.shape {moba_cu_seqlen_kv.shape} != {moba_cu_seqlen_q.shape}"
+
 
     
+
+
 
 
