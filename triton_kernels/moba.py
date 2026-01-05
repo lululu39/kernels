@@ -44,6 +44,139 @@ def calculate_chunks(
 
     return (cu_chunk, filtered_chunk_indices, num_filtered_chunk, chunk_to_batch)
 
+class MoBAAttention(torch.autograd.Function):
+
+    @staticmethod
+    def forward(
+        ctx,
+        q,
+        k,
+        v,
+        self_attn_cu_seqlen,
+        moba_q,
+        moba_kv,
+        moba_cu_seqlen_q,
+        moba_cu_seqlen_kv,
+        max_seqlen,
+        chunk_size,
+        moba_q_th_indices,
+    ):
+        
+        ctx.max_seqlen = max_seqlen
+        ctx.chunk_size = chunk_size
+        ctx.scale = scale = q.shape[-1] ** (-0.5)
+
+        # NOTE: lse shape
+
+        self_attn_out, self_attn_lse, _, _ = _flash_attn_varlen_forward(
+            q=q,
+            k=k,
+            v=v,
+            cu_seqlens_q=self_attn_cu_seqlen,
+            cu_seqlens_k=self_attn_cu_seqlen,
+            max_seqlen_q=max_seqlen,
+            max_seqlen_k=max_seqlen,
+            softmax_scale=scale,
+            causal=True,
+            dropout_p=0.0,
+        )
+
+        moba_attn_out, moba_attn_lse, _, _ = _flash_attn_varlen_forward(
+            q=moba_q,
+            k=moba_kv[:, 0],
+            v=moba_kv[:, 1],
+            cu_seqlens_q=moba_cu_seqlen_q,
+            cu_seqlens_k=moba_cu_seqlen_kv,
+            max_seqlen_q=max_seqlen,
+            max_seqlen_k=chunk_size,
+            softmax_scale=scale,
+            causal=False, # NOTE: because the blocks are complete 
+            dropout_p=0.0
+        )
+
+        # change lse to T H  shape
+        self_attn_lse = self_attn_lse.t().contiguous() # [T, H]
+        moba_attn_lse = moba_attn_lse.t().contiguous # [S, 1]
+
+        out = torch.zeros_like(q, device=q.device, dtype=torch.float32)
+
+        out_2d = out.view(-1, q.shape[2]) # [T * H, D]
+
+        # calc mixed_lse
+        # minus max lse to avoid exp explosion
+        max_lse_1d = self_attn_lse.view(-1) # [T * H]
+        max_lse_1d = max_lse_1d.index_reduce(
+            0, moba_q_th_indices, moba_attn_lse.view(-1), "amax"
+        )
+        self_attn_lse = self_attn_lse - max_lse_1d.view_as(self_attn_lse) # for exp numerical stability
+        moba_attn_lse = (
+            moba_attn_lse.view(-1)
+            .sub(max_lse_1d.index_select(0, moba_q_th_indices))
+            .reshape_as(moba_attn_lse)
+        ) # minus max value
+
+        mixed_attn_se = self_attn_lse.exp()
+        moba_attn_se = moba_attn_lse.exp()
+
+        mixed_attn_se.view(-1).index_add_(
+            0, moba_q_th_indices, moba_attn_se.view(-1)
+        )
+        mixed_attn_lse = mixed_attn_se.log() # [T, H] 始终按照原本q的布局来思考就好了
+
+        # add self attn
+        factor = (self_attn_lse - mixed_attn_lse).exp()  # [T, H] we use new denominator
+        self_attn_out = self_attn_out * factor.unsqueeze(-1) 
+        out_2d += self_attn_out.reshape_as(out_2d) # [T * H, D]
+
+        # add moba
+
+        mixed_attn_lse_moba = (
+            mixed_attn_lse.view(-1)
+            .index_select(0, moba_q_th_indices)
+            .view_as(moba_attn_lse)
+        )
+
+        factor = (moba_attn_lse - mixed_attn_lse_moba) # [S, 1]
+
+        moba_attn_out = moba_attn_out * factor.unsqueeze(-1) # [S, 1, D]
+
+        moba_attn_out = moba_attn_out.view(-1, moba_attn_out.shape[2]) # [S, D]
+
+        out_2d.index_add_(0, moba_q_th_indices, moba_attn_out)
+
+        out = out.to(q.dtype)
+
+        # add back max lse, previously minize max is for numerical stability
+        mixed_attn_lse += max_lse_1d.view_as(mixed_attn_lse)
+
+        ctx.save_for_backward(
+            out,
+            mixed_attn_lse,
+            q,
+            k,
+            v,
+            self_attn_cu_seqlen,
+            moba_q,
+            moba_kv,
+            moba_cu_seqlen_q,
+            moba_cu_seqlen_kv,
+            moba_q_th_indices
+        )
+
+        return out, mixed_attn_lse
+
+
+
+
+
+
+
+
+
+
+
+
+
 
 def mixture_of_block_attention(
     q: torch.Tensor,
@@ -80,6 +213,8 @@ def mixture_of_block_attention(
 
     if not need_moba:
         raise ValueError("MoBA needs topk larger than 0!")
+    
+    self_attn_cu_seqlen = cu_chunk
 
     # then we filter kv
     filtered_kv_indices = torch.arange(
@@ -175,7 +310,19 @@ def mixture_of_block_attention(
     ), f"moba_cu_seqlen_kv.shape != moba_cu_seqlen_q.shape {moba_cu_seqlen_kv.shape} != {moba_cu_seqlen_q.shape}"
 
 
-    
+    return MoBAAttention.apply(
+        q,
+        k,
+        v,
+        self_attn_cu_seqlen,
+        moba_q,
+        moba_kv,
+        moba_cu_seqlen_q,
+        moba_cu_seqlen_kv,
+        max_seqlen,
+        chunk_size,
+        moba_q_th_indices,
+    )
 
 
 
