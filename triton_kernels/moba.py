@@ -163,19 +163,95 @@ class MoBAAttention(torch.autograd.Function):
             moba_q_th_indices
         )
 
-        return out, mixed_attn_lse
+        return out
 
+    def backward(ctx, dout):
 
+        max_seqlen = ctx.max_seqlen
+        chunk_size = ctx.chunk_size
+        scale = ctx.scale
 
+        (
+            out,
+            mixed_attn_lse,
+            q,
+            k,
+            v,
+            self_attn_cu_seqlen,
+            moba_q,
+            moba_kv,
+            moba_cu_seqlen_q,
+            moba_cu_seqlen_kv,
+            moba_q_th_indices,
 
+        ) = ctx.saved_tensors
 
+        dq = torch.zeros_like(q)
+        dk = torch.zeros_like(k)
+        dv = torch.zeros_like(v)
 
+        # NOTE: we can use dout for both because out = out_self_attn + out_moba_attn, so pass to two branch with no problems
 
+        _flash_attn_varlen_backward(
+            dout=dout,
+            q=q,
+            k=k,
+            v=v,
+            out=out,
+            softmax_lse=mixed_attn_lse.t().contiguous(), # trasnspose back
+            dq=dq,
+            dk=dk,
+            dv=dv,
+            cu_seqlens_q=self_attn_cu_seqlen,
+            cu_seqlens_k=self_attn_cu_seqlen,
+            max_seqlen_q=max_seqlen,
+            max_seqlen_k=max_seqlen,
+            softmax_scale=scale,
+            causal=True,
+            dropout_p=0.0,
+            window_size=(-1, -1),
+            softcap=0.0,
+            alibi_slopes=None,
+            deterministic=True,
+        ) # inplace modify dq, dk, dv
 
+        dmq = torch.zeros_like(moba_q)
+        dmk = torch.zeros_like(moba_kv[:, 0])
+        dmv = torch.zeros_like(moba_kv[:, 1])
 
+        D = q.shape[-1]
 
+        d_moba_out = dout.view(-1, D).index_select(0, moba_q_th_indices).unsqueeze(1) # [S, 1, D]
+        moba_out = out.view(-1, D).index_select(0, moba_q_th_indices).unsqueeze(1) # [S, 1, D]
 
+        mixed_attn_lse_moba = mixed_attn_lse.view(-1).index_select(0, moba_q_th_indices).view(1, -1) # [1, S] transpose back
 
+        _flash_attn_varlen_backward(
+            dout=d_moba_out,
+            q=moba_q,
+            k=moba_kv[:, 0],
+            v=moba_kv[:, 1],
+            out=moba_out,
+            softmax_lse=mixed_attn_lse_moba,
+            dq=dmq,
+            dk=dmk,
+            dv=dmv,
+            cu_seqlens_q=moba_cu_seqlen_q,
+            cu_seqlens_k=moba_cu_seqlen_kv,
+            max_seqlen_q=max_seqlen,
+            max_seqlen_k=chunk_size,
+            softmax_scale=scale,
+            causal=False,
+            dropout_p=0.0,
+            window_size=(-1, -1),
+            softcap=0.0,
+            alibi_slopes=None,
+            deterministic=True,
+        )
+
+        dmkv = torch.stack((dmk, dmv), dim=1) # [S, 2, D]
+
+        return dq, dk, dv, None, dmq, dmkv, None, None, None, None, None
 
 
 def mixture_of_block_attention(
