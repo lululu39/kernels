@@ -1,6 +1,7 @@
 import triton.language as tl
 import triton
 import torch
+from fla.ops.utils.index import prepare_chunk_indices
 from fla.utils import contiguous, autocast_custom_bwd, autocast_custom_fwd
 from typing import Optional
 
@@ -31,13 +32,21 @@ def mean_pooling_fwd_kernel(
     i_d, i_nt, i_bh = tl.program_id(0), tl.program_id(1), tl.program_id(2)
     i_b, i_h = i_bh // H, i_bh % H
 
-    NT = tl.cdiv(T, BT)
+    if IS_VARLEN:
+        # sed id, chunk id
+        i_tg = i_nt
+        i_n, i_nt = tl.load(chunk_indices + i_nt * 2).to(tl.int32), tl.load(chunk_indices + i_nt * 2 + 1).to(tl.int32)
+        bos, eos = tl.load(cu_seqlens + i_n).to(tl.int32), tl.load(cu_seqlens + i_n + 1).to(tl.int32)
+        T = eos - bos # for varlen, we need to online calculate seqlen
+        NT = tl.cdiv(T, BT)
+    else:
+        NT = tl.cdiv(T, BT)
 
-    bos = i_b * T
-    bos_n = i_b * NT
+        bos = i_b * T
+        i_tg = i_b * NT + i_nt
 
     p_x = tl.make_block_ptr(x + (bos * H + i_h) * D, (T, D), (H * D, 1), (i_nt * BT, i_d * BD), (BT, BD), (1, 0))
-    p_y = tl.make_block_ptr(y + ((bos_n + i_nt) * H + i_h) * D, (D,), (1,), (i_d * BD,), (BD,), (0,))
+    p_y = tl.make_block_ptr(y + (i_tg * H + i_h) * D, (D,), (1,), (i_d * BD,), (BD,), (0,))
 
     b_x = tl.load(p_x, boundary_check=(0,1)).to(tl.float32) # NOTE: cast here
     b_y = tl.sum(b_x, axis=0) / min(BT, T - i_nt * BT)
@@ -71,13 +80,19 @@ def mean_pooling_bwd_kernel(
     i_d, i_nt, i_bh = tl.program_id(0), tl.program_id(1), tl.program_id(2)
     i_b, i_h = i_bh // H, i_bh % H
 
-    NT = tl.cdiv(T, BT)
-
-    bos = i_b * T
-    bos_n = i_b * NT
+    if IS_VARLEN:
+        i_tg = i_nt
+        i_n, i_nt = tl.load(chunk_indices + i_nt * 2).to(tl.int32), tl.load(chunk_indices + i_nt * 2 + 1).to(tl.int32)
+        bos, eos = tl.load(cu_seqlens + i_n).to(tl.int32), tl.load(cu_seqlens + i_n + 1).to(tl.int32)
+        T = eos - bos
+        NT = tl.cdiv(T, BT)
+    else:
+        NT = tl.cdiv(T, BT)
+        bos = i_b * T
+        i_tg = i_b * NT + i_nt
 
     p_dx = tl.make_block_ptr(dx + (bos * H + i_h) * D, (T, D), (H * D, 1), (i_nt * BT, i_d * BD), (BT, BD), (1, 0))
-    p_dy = tl.make_block_ptr(dy + ((bos_n + i_nt) * H + i_h) * D, (D,), (1,), (i_d * BD,), (BD,), (0,))
+    p_dy = tl.make_block_ptr(dy + (i_tg * H + i_h) * D, (D,), (1,), (i_d * BD,), (BD,), (0,))
 
     b_dy = tl.load(p_dy, boundary_check=(0,))
 
@@ -91,9 +106,9 @@ def mean_pooling_fwd(
 ):
     B, T, H, D = x.shape
     BT = chunk_size
-    # chunk_indices = prepare_chunk_indices(cu_seqlens, chunk_size) if cu_seqlens is not None else None
-    chunk_indices = None
-    NT = triton.cdiv(T, BT) if cu_seqlens is None else len(chunk_indices)
+    # NOTE: shape is [chunk_num, 2] where each row contains (sequence_id, chunk_index)
+    chunk_indices = prepare_chunk_indices(cu_seqlens, chunk_size) if cu_seqlens is not None else None
+    NT = triton.cdiv(T, BT) if cu_seqlens is None else len(chunk_indices) #  how many chunks to be consicdered
     y = torch.empty(B, NT, H, D, dtype=x.dtype, device=x.device)
     def grid(meta): return (triton.cdiv(D, meta['BD']), NT, B * H) # NOTE: this function
     # NOTE: when using meta, no need to specify in function
@@ -117,9 +132,9 @@ def mean_pooling_bwd(
     cu_seqlens: Optional[torch.LongTensor] = None,  
 ):
     B, T, H, D = batch_size, seq_len, *dy.shape[-2:]
-    NT = dy.shape[1]
     BT = chunk_size
-    chunk_indices = None
+    chunk_indices = prepare_chunk_indices(cu_seqlens, chunk_size) if cu_seqlens is not None else None
+    NT = triton.cdiv(T, BT) if cu_seqlens is None else len(chunk_indices)
     dx = torch.empty(B, T, H, D, dtype=dy.dtype, device=dy.device)
     def grid(meta): return (triton.cdiv(D, meta['BD']), NT, B * H) # NOTE: this function
     mean_pooling_bwd_kernel[grid](
