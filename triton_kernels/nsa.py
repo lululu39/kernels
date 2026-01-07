@@ -2,6 +2,7 @@ import triton.language as tl
 import triton
 import torch
 from fla.utils import autocast_custom_bwd, autocast_custom_fwd, check_shared_mem, contiguous
+from fla.ops.utils import prepare_chunk_indices, prepare_chunk_offsets, prepare_token_indices
 
 try:
     from flash_attn import flash_attn_varlen_func, flash_attn_func
@@ -62,11 +63,19 @@ def nsa_compression_fwd_kernel(
     i_t, i_v, i_bh = tl.program_id(0), tl.program_id(1), tl.program_id(2)
     i_b, i_h = i_bh // H, i_bh % H # NOTE: why not HQ as in FA2? because we are dealing with all HQ query heads (they share the same KV heads) in a single block
 
+
+    if IS_VARLEN:
+        i_n, i_t = tl.load(token_indices + i_t * 2).to(tl.int32), tl.load(token_indices + i_t * 2 + 1).to(tl.int32)
+        bos, eos = tl.load(cu_seqlens + i_n).to(tl.int32), tl.load(cu_seqlens + i_n + 1).to(tl.int32)
+        T = eos - bos
+        boc = tl.load(chunk_offsets + i_n).to(tl.int32) # how many chunks before
+    else:
+        bos, eos = i_b * T, (i_b + 1) * T
+        boc = i_b * tl.cdiv(T, BS)
+
+
     TC = tl.cdiv(T, BS) # total blocks in original sequence
     NC = (i_t + 1) // BS # how many valid blocks for a query group at position i_t
-
-    bos, eos = i_b * T, (i_b + 1) * T
-    boc = i_b * TC
 
     # use base to aceess last two dims block
 
@@ -166,23 +175,29 @@ def nsa_compression_bwd_kernel_dq(
     # lse [B, T, HQ]
     # delta [B, T, HQ]
 
-
+    all = B * T # for vasrlen's sake, need to place before T is updated
     i_t, i_v, i_bh = tl.program_id(0), tl.program_id(1), tl.program_id(2)
     i_b, i_h = i_bh // H, i_bh % H # NOTE: why not HQ as in FA2? because we are dealing with all HQ query heads (they share the same KV heads) in a single block
 
-    TC = tl.cdiv(T, BS) # total blocks in original sequence
-    NC = (i_t + 1) // BS # how many valid blocks for a query group at position i_t
-
-    bos, eos = i_b * T, (i_b + 1) * T
-    boc = i_b * TC
+    if IS_VARLEN:
+        i_n, i_t = tl.load(token_indices + i_t * 2).to(tl.int32), tl.load(token_indices + i_t * 2 + 1).to(tl.int32)
+        bos, eos = tl.load(cu_seqlens + i_n).to(tl.int32), tl.load(cu_seqlens + i_n + 1).to(tl.int32)
+        T = eos - bos
+        boc = tl.load(chunk_offsets + i_n).to(tl.int32)
+    else:
+        bos, eos = i_b * T, i_b * T + T
+        boc = i_b * tl.cdiv(T, BS)
 
     # precompute the base pointer
+
+    TC = tl.cdiv(T, BS) # total blocks in original sequence
+    NC = (i_t + 1) // BS # how many valid blocks for a query group at position i_t
 
     q += (bos + i_t) * HQ * K
     do += (bos + i_t) * HQ * V
     lse += (bos + i_t) * HQ
     delta += (bos + i_t) * HQ
-    dq += (i_v * B * T + bos + i_t) * HQ * K
+    dq += (i_v * all + bos + i_t) * HQ * K
 
     p_q = tl.make_block_ptr(q, (HQ, K), (K, 1), (i_h * G, 0), (G, BK), (1, 0))
     p_dq = tl.make_block_ptr(dq, (HQ, K), (K, 1), (i_h * G, 0), (G, BK), (1, 0))
@@ -280,14 +295,23 @@ def nsa_compression_bwd_kernel_dkv(
     i_c, i_v, i_bh = tl.program_id(0), tl.program_id(1), tl.program_id(2) # NOTE: i_t to i_c, offsets
     i_b, i_h = i_bh // H, i_bh % H # NOTE: why not HQ as in FA2? because we are dealing with all HQ query heads (they share the same KV heads) in a single block
 
-    TC = tl.cdiv(T, BS) # total blocks in original sequence
+    all = B * tl.cdiv(T, BS)
 
-    bos, eos = i_b * T, (i_b + 1) * T
-    boc = i_b * TC
+    if IS_VARLEN:
+        # NOTE: problems here!
+        i_n, i_c = tl.load(chunk_indices + i_c * 2).to(tl.int32), tl.load(chunk_indices + i_c * 2 + 1).to(tl.int32)
+        bos, eos = tl.load(cu_seqlens + i_n).to(tl.int32), tl.load(cu_seqlens + i_n + 1).to(tl.int32)
+        T = eos - bos
+        boc = tl.load(chunk_offsets + i_n).to(tl.int32)
+    else:
+        bos, eos = i_b * T, i_b * T + T
+        boc = i_b * tl.cdiv(T, BS)
+    
+    TC = tl.cdiv(T, BS) # total blocks in original sequence
 
     k += (boc * H + i_h) * K
     v += (boc * H + i_h) * V
-    dk += (i_v * B * TC * H + boc * H + i_h) * K
+    dk += (i_v * all * H + boc * H + i_h) * K
     dv += (boc * H + i_h) * V
 
     p_k = tl.make_block_ptr(k, (TC, K), (H*K, 1), (i_c * BC, 0), (BC, BK), (1,0))
@@ -826,10 +850,8 @@ def nsa_compression_fwd(
     NV = triton.cdiv(V, BV)
     assert NK == 1, "The key dimension can not be larger than 256"
 
-    # NOTE: we ignore varlen here!
-
-    # chunk_offsets = prepare_chunk_offsets(cu_seqlens, BS) if cu_seqlens is not None else None
-    chunk_offsets =  None
+    # NOTE: cumulative chunk number
+    chunk_offsets = prepare_chunk_offsets(cu_seqlens, BS) if cu_seqlens is not None else None
 
     grid = (T, NV, B * H)
 
@@ -884,8 +906,13 @@ def nsa_compression_bwd(
 
     NV = triton.cdiv(V, BV)
 
-    chunk_indices, chunk_offsets = None, None
-    NC = triton.cdiv(triton.cdiv(T, BS), BC)
+    if cu_seqlens is not None:
+        chunk_offsets = prepare_chunk_offsets(cu_seqlens, BS)
+        chunk_indices = prepare_chunk_indices(chunk_offsets, BC) # true chunk indices for compressed k and v
+        NC = len(chunk_indices) # total number of kv chunks (NOTE: chunk upon already compressed kv, so we use chunk_offsets to obtain chunk_indices for dkv kernel because we weant to process BC nuumber of kv (compressed!) tokens in one kernel)
+    else:
+        chunk_indices, chunk_offsets = None, None
+        NC = triton.cdiv(triton.cdiv(T, BS), BC)
 
     delta = preprocess(o, do)
 
@@ -904,7 +931,7 @@ def nsa_compression_bwd(
         scale=scale,
         cu_seqlens=cu_seqlens,
         token_indices=token_indices,
-        chunk_offsets=chunk_indices,
+        chunk_offsets=chunk_offsets,
         T=T,
         B=B,
         H=H,
@@ -963,8 +990,11 @@ class NSACompressionFunction(torch.autograd.Function):
     def forward(ctx, q, k, v, block_size, scale, cu_seqlens):
         ctx.dtype = q.dtype
 
-        # token_indices = prepare_token_indices(cu_seqlens) if cu_seqlens is not None else None
-        token_indices =  None
+        # 2-d sequence indices denoting the cu_seqlens of tokens in each sequence
+        # for example, if the passed `cu_seqlens` is [0, 2, 6],
+        # then there are 2 and 4 tokens in the 1st and 2nd sequences respectively, and `token_indices` will be
+        # [[0, 0], [0, 1], [1, 0], [1, 1], [1, 2], [1, 3]]
+        token_indices = prepare_token_indices(cu_seqlens) if cu_seqlens is not None else None
 
         o, lse = nsa_compression_fwd(
             q=q,
