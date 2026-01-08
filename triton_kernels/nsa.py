@@ -2,7 +2,7 @@ import triton.language as tl
 import triton
 import torch
 from fla.utils import autocast_custom_bwd, autocast_custom_fwd, check_shared_mem, contiguous
-from fla.ops.utils import prepare_chunk_indices, prepare_chunk_offsets, prepare_token_indices
+from fla.ops.utils import prepare_chunk_indices, prepare_chunk_offsets, prepare_token_indices, prepare_lens
 
 try:
     from flash_attn import flash_attn_varlen_func, flash_attn_func
@@ -405,13 +405,19 @@ def nsa_topk_kernel(
 
     i_b, i_h = i_bh // H, i_bh % H
 
+    if IS_VARLEN:
+        i_n, i_t = tl.load(token_indices + i_t * 2).to(tl.int32), tl.load(token_indices + i_t * 2 + 1).to(tl.int32)
+        bos, eos = tl.load(cu_seqlens + i_n).to(tl.int32), tl.load(cu_seqlens + i_n + 1).to(tl.int32)
+        T = eos - bos
+        boc = tl.load(chunk_offsets + i_n).to(tl.int32)
+    else:
+        bos, eos = i_b * T, i_b * T + T
+        boc = i_b * tl.cdiv(T, BS)
+
     TC = tl.cdiv(T, BS)
     # NOTE: when (i_t + 1) % BS == 0, NC != IC
     NC = (i_t + 1) // BS # this is a number
     IC = i_t // BS # this is a offset
-
-    bos, eos = i_b * T, (i_b + 1) * T
-    boc = i_b * TC
 
     p_q = tl.make_block_ptr(q + (bos + i_t) * HQ * K, (HQ, K), (K, 1), (i_h * G, 0), (G, BK), (1,0))
     p_lse = tl.make_block_ptr(lse + (bos + i_t) * HQ, (HQ,), (1,), (i_h * G,), (G,), (0,))
@@ -537,7 +543,12 @@ def nsa_selection_fwd_kernel(
 
     i_b, i_h = i_bh // H, i_bh % H
 
-    bos = i_b * T
+    if IS_VARLEN:
+        i_n, i_t = tl.load(token_indices + i_t * 2).to(tl.int32), tl.load(token_indices + i_t * 2 + 1).to(tl.int32)
+        bos, eos = tl.load(cu_seqlens + i_n).to(tl.int32), tl.load(cu_seqlens + i_n + 1).to(tl.int32)
+        T = eos - bos
+    else:
+        bos, eos = i_b * T, i_b * T + T
 
     p_q = tl.make_block_ptr(q + (bos + i_t) * HQ * K, (HQ, K), (K, 1), (i_h * G, 0), (G, BK), (1,0))
 
@@ -547,7 +558,11 @@ def nsa_selection_fwd_kernel(
     v += (bos * H + i_h) * V
     block_indices += (bos + i_t) * H * S + i_h * S
 
-    NS = S # number of selected blocks, currently default to S (the maximum value)
+    if USE_BLOCK_COUNTS:
+        # [B, T, H]
+        NS = tl.load(block_counts + (bos + i_t) * H + i_h)
+    else:
+        NS = S # number of selected blocks, currently default to S (the maximum value)
 
     p_o = tl.make_block_ptr(o + (bos + i_t) * HQ * V, (HQ, V), (V, 1), (i_h * G, i_v * BV), (G, BV), (1, 0)) # [G, BV]
 
@@ -641,13 +656,19 @@ def nsa_selection_bwd_kernel_dq(
 
     i_b, i_h = i_bh // H, i_bh % H
 
-    bos = i_b * T
+    all = B * T # NOTE: must placed boefore T is changed
+    if IS_VARLEN:
+        i_n, i_t = tl.load(token_indices + i_t * 2).to(tl.int32), tl.load(token_indices + i_t * 2 + 1).to(tl.int32)
+        bos, eos = tl.load(cu_seqlens + i_n).to(tl.int32), tl.load(cu_seqlens + i_n + 1).to(tl.int32)
+        T = eos - bos
+    else:
+        bos, eos = i_b * T, i_b * T + T
 
     block_indices += ((bos + i_t) * H + i_h) * S
 
     p_q = tl.make_block_ptr(q + (bos + i_t) * HQ * K, (HQ, K), (K, 1), (i_h * G, 0), (G, BK), (1,0))
 
-    p_dq = tl.make_block_ptr(dq + (i_v * B * T + bos + i_t) * HQ * K, (HQ, K), (K, 1), (i_h * G, 0), (G, BK), (1,0))
+    p_dq = tl.make_block_ptr(dq + (i_v * all + bos + i_t) * HQ * K, (HQ, K), (K, 1), (i_h * G, 0), (G, BK), (1,0))
 
     p_do = tl.make_block_ptr(do + (bos + i_t) * HQ * V, (HQ, V), (V, 1), (i_h * G, i_v * BV), (G, BV), (1,0))
 
@@ -665,7 +686,10 @@ def nsa_selection_bwd_kernel_dq(
 
     b_dq = tl.zeros([G, BK], dtype=tl.float32)
 
-    NS = S # number of selected blocks, currently default to S (the maximum value)
+    if USE_BLOCK_COUNTS:
+        NS = tl.load(block_counts + (bos + i_t) * H + i_h)
+    else:
+        NS = S # number of selected blocks, currently default to S (the maximum value)
 
 
     for i in tl.range(NS):
@@ -728,9 +752,12 @@ def nsa_selection_kernel_block_mask(
 
     b_i = tl.load(block_indices + ((bos + i_t) * H + i_h) * S + i_s) # NOTE: use scalar load!
 
-    b_m = ((b_i <= i_t // BS) and (b_i >= 0)) # again, first part is not required since we did this in top-k kernel and set invalid indices to -1
+    if USE_BLOCK_COUNTS:
+        # causality and less than predefined maximum blocks
+        b_m = b_i * BS <= i_t and i_s < tl.load(block_counts + i_b * T * H + i_t * H + i_h)
+    else:
+        b_m = ((b_i <= i_t // BS) and (b_i >= 0)) # again, first part is not required since we did this in top-k kernel and set invalid indices to -1
     # b_m = (b_i >= 0) # NOTE: this works as well!
-
 
     if b_i < NS and b_i >= 0:
         tl.store(block_mask + ((bos + i_t) * H + i_h) * NS + b_i, b_m.to(block_mask.dtype.element_ty))
@@ -783,7 +810,12 @@ def nsa_selection_bwd_kernel_dkv(
 
     all = B * T
 
-    bos = i_b * T
+    if IS_VARLEN:
+        i_n, i_s = tl.load(chunk_indices + i_s * 2).to(tl.int32), tl.load(chunk_indices + i_s * 2 + 1).to(tl.int32)
+        bos, eos = tl.load(cu_seqlens + i_n).to(tl.int32), tl.load(cu_seqlens + i_n + 1).to(tl.int32)
+        T = eos - bos
+    else:
+        bos, eos = i_b * T, i_b * T + T
 
     p_k = tl.make_block_ptr(k + (bos * H + i_h) * K, (T, K), (H * K, 1), (i_s * BS, 0), (BS, BK), (1,0))
     p_v = tl.make_block_ptr(v + (bos * H + i_h) * V, (T, V), (H * V, 1), (i_s * BS, i_v * BV), (BS, BV), (1,0))
@@ -1119,7 +1151,10 @@ def nsa_selection_block_mask(
 ):
     B, T, H, S = block_indices.shape
     BS = block_size
-    NS = triton.cdiv(T, BS)
+    if cu_seqlens is not None:
+        NS = triton.cdiv(prepare_lens(cu_seqlens).max().item(), BS)
+    else:
+        NS = triton.cdiv(T, BS)
     block_mask = torch.zeros(B, T, H, NS, dtype=torch.bool, device=block_indices.device)
 
     nsa_selection_kernel_block_mask[(B, T, H * S)](
@@ -1156,8 +1191,6 @@ def nsa_selection_bwd(
 
     NV = triton.cdiv(V, BV)
     
-    NS = triton.cdiv(T, BS) # used for dkv kernel
-
     from .fa2 import flash_attention_2_bwd_preprocess as preprocess
 
     delta = preprocess(o, do)
@@ -1190,8 +1223,14 @@ def nsa_selection_bwd(
         BV=BV,
     )
 
-    chunk_indices = None
     dq = dq.sum(0)
+
+    if cu_seqlens is not None:
+        chunk_indices = prepare_chunk_indices(cu_seqlens, BS)
+        NS = len(chunk_indices)
+    else:
+        chunk_indices = None
+        NS = triton.cdiv(T, BS)
 
     grid = (NS, NV, B * H)
 
@@ -1239,8 +1278,7 @@ class NSASelectionFunction(torch.autograd.Function):
     def forward(ctx, q, k, v, block_indices, block_counts, block_size, scale, cu_seqlens):
         ctx.dtype = q.dtype
 
-        # token_indices = prepare_token_indices(cu_seqlens) if cu_seqlens is not None else None
-        token_indices = None
+        token_indices = prepare_token_indices(cu_seqlens) if cu_seqlens is not None else None
 
         o, lse = nsa_selection_fwd(
             q=q,
@@ -1329,11 +1367,9 @@ def nsa_topk(
 
     block_indices = torch.zeros(B, T, H, S, dtype=torch.int32, device=q.device)
 
-    # token_indices = prepare_token_indices(cu_seqlens) if cu_seqlens is not None else None
-    # chunk_offsets = prepare_chunk_offsets(cu_seqlens, BS) if cu_seqlens is not None else None
+    token_indices = prepare_token_indices(cu_seqlens) if cu_seqlens is not None else None
+    chunk_offsets = prepare_chunk_offsets(cu_seqlens, BS) if cu_seqlens is not None else None
 
-    token_indices = None
-    chunk_offsets = None
     grid = (T, B * H)
     nsa_topk_kernel[grid](
         q=q,
