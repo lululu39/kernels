@@ -251,7 +251,7 @@ def nsa_compression_bwd_kernel_dq(
     ],
     key=['BS', 'BK', 'BV'],
 )
-@triton.jit(do_not_specialize=['T'])
+@triton.jit(do_not_specialize=['T', 'TC'])
 def nsa_compression_bwd_kernel_dkv(
     q,
     k,
@@ -266,6 +266,7 @@ def nsa_compression_bwd_kernel_dkv(
     chunk_indices, # varlen
     chunk_offsets, # varlen
     T,
+    TC,
     B: tl.constexpr,
     H: tl.constexpr,
     HQ: tl.constexpr,
@@ -295,20 +296,19 @@ def nsa_compression_bwd_kernel_dkv(
     i_c, i_v, i_bh = tl.program_id(0), tl.program_id(1), tl.program_id(2) # NOTE: i_t to i_c, offsets
     i_b, i_h = i_bh // H, i_bh % H # NOTE: why not HQ as in FA2? because we are dealing with all HQ query heads (they share the same KV heads) in a single block
 
-    all = B * tl.cdiv(T, BS)
+    all = B * TC
 
     if IS_VARLEN:
         # NOTE: problems here!
         i_n, i_c = tl.load(chunk_indices + i_c * 2).to(tl.int32), tl.load(chunk_indices + i_c * 2 + 1).to(tl.int32)
         bos, eos = tl.load(cu_seqlens + i_n).to(tl.int32), tl.load(cu_seqlens + i_n + 1).to(tl.int32)
         T = eos - bos
+        TC = tl.cdiv(T, BS)
         boc = tl.load(chunk_offsets + i_n).to(tl.int32)
     else:
         bos, eos = i_b * T, i_b * T + T
         boc = i_b * tl.cdiv(T, BS)
     
-    TC = tl.cdiv(T, BS) # total blocks in original sequence
-
     k += (boc * H + i_h) * K
     v += (boc * H + i_h) * V
     dk += (i_v * all * H + boc * H + i_h) * K
@@ -929,6 +929,7 @@ def nsa_compression_bwd(
 ):
     
     B, T, HQ, K, V, H = *q.shape, v.shape[-1], k.shape[-2]
+    TC = k.shape[1]
     G = HQ // H
 
     BC = BS = block_size
@@ -998,6 +999,7 @@ def nsa_compression_bwd(
         chunk_indices=chunk_indices,
         chunk_offsets=chunk_offsets,
         T=T,
+        TC=TC,
         B=B,
         H=H,
         HQ=HQ,
