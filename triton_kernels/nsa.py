@@ -10,7 +10,8 @@ except ImportError:
     flash_attn_varlen_func = None
     flash_attn_func = None
 
-from .fa2 import flash_attention_2_bwd_preprocess as preprocess
+# from .fa2_ht import flash_attention_2_bwd_preprocess as preprocess
+from fla.ops.attn.parallel import parallel_attn_bwd_preprocess as preprocess
 
 from .pooling import my_mean_pooling
 from .sort import _bitonic_merge, _compare_and_swap # NOTE: we must import rather than directly copy to this file to avoid compilation error
@@ -1193,8 +1194,6 @@ def nsa_selection_bwd(
 
     NV = triton.cdiv(V, BV)
     
-    from .fa2 import flash_attention_2_bwd_preprocess as preprocess
-
     delta = preprocess(o, do)
 
     dq = torch.empty(NV, *q.shape, dtype=q.dtype if NV == 1 else torch.float, device=q.device)

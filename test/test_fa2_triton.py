@@ -3,7 +3,7 @@ import os
 import pytest
 import torch
 
-from triton_kernels.fa2 import flash_attention_2
+from triton_kernels.fa2_ht import flash_attention_2_ht
 from fla.ops.utils import prepare_lens
 from fla.utils import assert_close, check_shared_mem, device
 
@@ -60,7 +60,7 @@ def test_parallel(
     # transpoe back to B, H, T, D
     ref = ref.transpose(1, 2)
 
-    tri = flash_attention_2(q=q, k=k, v=v, scale=scale, causal=causal)
+    tri = flash_attention_2_ht(q=q, k=k, v=v, scale=scale, causal=causal)
     tri.backward(do)
     tri_dq, q.grad = q.grad.clone(), None
     tri_dk, k.grad = k.grad.clone(), None
