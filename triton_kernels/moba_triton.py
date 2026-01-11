@@ -139,3 +139,121 @@ def moba_topk_kernel(
     # this HQ * S is to avoid shape manipulation for b_top
     p_b = tl.make_block_ptr(block_indices + (bos + i_t) * HQ * S, (HQ * S,), (1,), (i_hq * S,), (S,), (0,))
     tl.store(p_b, b_top.to(p_b.dtype.element_ty))
+
+
+@triton.heuristics({
+    'IS_VARLEN': lambda args: args['cu_seqlens'] is not None,
+    'USE_BLOCK_COUNTS': lambda args: isinstance(args['block_counts'], torch.Tensor),
+})
+@triton.autotune(
+    configs=[
+        triton.Config({}, num_warps=num_warps)
+        for num_warps in [1, 2, 4]
+    ],
+    key=['BS', 'BK', 'BV'],
+)
+@triton.jit
+def moba_fwd_kernel(
+    q,
+    k,
+    v,
+    o,
+    lse,
+    scale,
+    block_indices,
+    block_counts,
+    cu_seqlens,
+    token_indices,
+    T,
+    H: tl.constexpr,
+    HQ: tl.constexpr,
+    G: tl.constexpr,
+    K: tl.constexpr,
+    V: tl.constexpr,
+    S: tl.constexpr,
+    BS: tl.constexpr,
+    BK: tl.constexpr,
+    BV: tl.constexpr,
+    IS_VARLEN: tl.constexpr, # varlen
+    USE_BLOCK_COUNTS: tl.constexpr,
+):
+    
+    # q [B, T, HQ, K]
+    # k [B, T, H, K] NOTE: non-compressed k and v
+    # v [B, T, H, V]
+    # o [B, T, HQ, V]
+    # lse [B, T, HQ]
+    # block_indices [B, T, HQ, S]
+
+
+    i_t, i_v, i_bhq = tl.program_id(0), tl.program_id(1), tl.program_id(2)
+
+    i_b, i_hq = i_bhq // HQ, i_bhq % HQ
+
+    i_h = i_hq // G
+
+    if IS_VARLEN:
+        i_n, i_t = tl.load(token_indices + i_t * 2).to(tl.int32), tl.load(token_indices + i_t * 2 + 1).to(tl.int32)
+        bos, eos = tl.load(cu_seqlens + i_n).to(tl.int32), tl.load(cu_seqlens + i_n + 1).to(tl.int32)
+        T = eos - bos
+    else:
+        bos, eos = i_b * T, i_b * T + T
+    
+    p_q = tl.make_block_ptr(q + (bos + i_t) * HQ * K, (HQ, K), (K, 1), (i_hq, 0), (1, BK), (1, 0))
+
+    b_q = tl.load(p_q, boundary_check=(0,1))
+
+    k += (bos * H + i_h) * K
+    v += (bos * H + i_h) * V
+
+    block_indices += (bos + i_t) * HQ * S + i_hq * S
+
+    if USE_BLOCK_COUNTS:
+        # [B, T, HQ]
+        NS = tl.load(block_counts + (bos + i_t) * HQ + i_hq)
+    else:
+        NS = S 
+    
+    p_o = tl.make_block_ptr(o + (bos + i_t) * HQ * V, (HQ, V), (V, 1), (i_hq, i_v * BV), (1, BV), (1,0))
+
+    p_lse = tl.make_block_ptr(lse + (bos + i_t) * HQ, (HQ,), (1,), (i_hq,), (1,), (0,))
+
+    b_o = tl.zeros([1, BV], dtype=tl.float32)
+
+    b_m = tl.full([1], float('-inf'), dtype=tl.float32)
+    b_acc = tl.zeros([1], dtype=tl.float32)
+
+    for i in tl.range(NS):
+
+        i_s = tl.load(block_indices + i).to(tl.int32) * BS # offset for kv blocks
+
+        if i_s <= i_t and i_s >= 0:
+            o_s = i_s + tl.arange(0, BS) # a block offset
+
+            p_k = tl.make_block_ptr(K, (K, T), (1, H * K), (0, i_s), (BK, BS), (0, 1))
+
+            p_v = tl.make_block_ptr(v, (T, V), (H * V, 1), (i_s, i_v * BV), (BS, BV), (1,0))
+
+            b_k = tl.load(p_k, boundary_check=(0,1)) # [BK, BS]
+
+            b_v = tl.load(p_v, boundary_check=(0,1)) # [BS, BV]
+
+            b_s = tl.dot(b_q, b_k) * scale # [1, BS]
+
+            b_s = tl.where((o_s < i_t)[None, :], b_s, float('-inf'))
+
+            b_m, b_mp = tl.maximum(b_m, tl.max(b_s, 1)), b_m
+
+            b_r = tl.exp(b_mp - b_m) # [1,]
+
+            b_p = tl.exp(b_s - b_m[:, None])
+
+            b_acc = b_acc * b_r + tl.sum(b_p, 1)
+
+            b_o = b_o * b_r[:, None] + tl.dot(b_p.to(b_v.dtype), b_v) # [1, BV]
+
+    b_o = b_o / b_acc[:, None] # broadcast
+    b_m += tl.log(b_acc) # lse
+
+    tl.store(p_lse, b_m.to(p_lse.dtype.element_ty), boundary_check=(0,))
+    tl.store(p_o, b_o.to(p_o.dtype.element_ty), boundary_check=(0,1))
