@@ -375,3 +375,40 @@ def moba_bwd_kernel_dq(
 
     tl.store(p_dq, b_dq.to(p_dq.dtype.element_ty), boundary_check=(0,1))
 
+
+@triton.heuristics({
+    'USE_BLOCK_COUNTS': lambda args: isinstance(args['block_counts'], torch.Tensor)
+})
+@triton.jit(do_not_specialize=['T'])
+def moba_kernel_block_mask(
+    block_indices,
+    block_counts,
+    block_mask,
+    HQ: tl.constexpr,
+    S: tl.constexpr,
+    T,
+    BS: tl.constexpr,
+    NS: tl.constexpr,
+    USE_BLOCK_COUNTS: tl.constexpr # not used currently
+):  
+    # NOTE: basically the same as NSA, except for the head processing
+    
+    # block_indices [B, T, HQ, S]
+    # NOTE: for dkv kernel, we add additional G dimension and then aggregate along this dimension, to support GQA
+
+    i_b, i_t, i_hqs = tl.program_id(0), tl.program_id(1), tl.program_id(2)
+    
+    i_hq, i_s = i_hqs // S, i_hqs % S
+
+    bos = i_b * T
+
+    b_i = tl.load(block_indices + ((bos + i_t) * HQ + i_hq) * S + i_s) # NOTE: use scalar load!
+    
+    if USE_BLOCK_COUNTS:
+        # causality and less than predefined maximum blocks
+        b_m = b_i * BS <= i_t and i_s < tl.load(block_counts + i_b * T * HQ + i_t * HQ + i_hq)
+    else:
+        b_m = ((b_i <= i_t // BS) and (b_i >= 0))
+
+    if b_i < NS and b_i >= 0:
+        tl.store(block_mask + ((bos + i_t) * HQ + i_hq) * NS + b_i, b_m.to(block_mask.dtype.element_ty))
