@@ -412,3 +412,108 @@ def moba_kernel_block_mask(
 
     if b_i < NS and b_i >= 0:
         tl.store(block_mask + ((bos + i_t) * HQ + i_hq) * NS + b_i, b_m.to(block_mask.dtype.element_ty))
+
+
+@triton.heuristics({
+    'IS_VARLEN': lambda args: args['cu_seqlens'] is not None
+})
+@triton.autotune(
+    configs=[
+        triton.Config({}, num_warps=num_warps)
+        for num_warps in [1, 2, 4]
+    ],
+    key=['BS', 'BK', 'BV'],
+)
+@triton.jit(do_not_specialize=['T'])
+def moba_bwd_kernel_dkv(
+    q,
+    k,
+    v,
+    lse,
+    delta,
+    do,
+    dk,
+    dv,
+    scale,
+    block_mask, # use this instaed of online computing a block is valid or not
+    cu_seqlens, # varlen
+    chunk_indices, # varlen
+    T,
+    B: tl.constexpr, 
+    H: tl.constexpr,
+    HQ: tl.constexpr,
+    M: tl.constexpr, # NOTE: besically cdiv(T, BS)
+    G: tl.constexpr, # NOTE: groups of query sharing the same KV set, this is a must because we maybe using use GQA
+    K: tl.constexpr,
+    V: tl.constexpr,
+    BS: tl.constexpr, # block size of compression
+    BK: tl.constexpr,
+    BV: tl.constexpr,
+    IS_VARLEN: tl.constexpr, # meta param
+):
+    # bk and bv should be [BS, BK] and [BV, BS]
+
+    # NOTE: for moba, we do not share the same selectin in a query group, so must add one dimension G to aggregate all the gradients
+    # dk: [NV * G, T, H, K]
+    # dv: [G, T, H, V] because v does not need to aggregate along NV
+
+    # NOTE: we use NS = cdiv(T, BS) to iterate all blocks (including incomplete ones)
+    # because dk and dv is torch.empty, so we nned to store zero into the incomplete block (eve if we do not calculate it)
+    # as for block_mask kernel, i don't think cdiv is required, since block_mask is initially zero
+    i_s, i_vg, i_bh = tl.program_id(0), tl.program_id(1), tl.program_id(2)
+
+    i_b, i_h = i_bh // H, i_bh % H
+    i_v, i_g = i_vg // G, i_vg % G
+
+    all = B * T
+
+    if IS_VARLEN:
+        i_n, i_s = tl.load(chunk_indices + i_s * 2).to(tl.int32), tl.load(chunk_indices + i_s * 2 + 1).to(tl.int32)
+        bos, eos = tl.load(cu_seqlens + i_n).to(tl.int32), tl.load(cu_seqlens + i_n + 1).to(tl.int32)
+        T = eos - bos
+    else:
+        bos, eos = i_b * T, i_b * T + T
+
+    p_k = tl.make_block_ptr(k + (bos * H + i_h) * K, (T, K), (H * K, 1), (i_s * BS, 0), (BS, BK), (1,0))
+    p_v = tl.make_block_ptr(v + (bos * H + i_h) * V, (T, V), (H * V, 1), (i_s * BS, i_v * BV), (BS, BV), (1,0))
+
+    # NOTE: k needs an extra NV dimension
+    p_dk = tl.make_block_ptr(dk + ((i_vg * all + bos) * H + i_h) * K, (T, K), (H * K, 1), (i_s * BS, 0), (BS, BK), (1,0))
+    p_dv = tl.make_block_ptr(dv + ((i_v * all + bos) * H + i_h) * V, (T, V), (H * V, 1), (i_s * BS, i_v * BV), (BS, BV), (1,0))
+
+    b_k = tl.load(p_k, boundary_check=(0,1)) # [BS, BK]
+    b_v = tl.load(p_v, boundary_check=(0,1)) # [BS, BV]
+
+    b_dk = tl.zeros([BS, BK], dtype=tl.float32)
+    b_dv = tl.zeros([BS, BV], dtype=tl.float32)
+
+    o_s = tl.arange(0, BS) + i_s * BS
+
+    for i in tl.range(i_s * BS, T):
+        b_m = tl.load(block_mask + (bos + i) * H * M + i_h * M + i_s)
+
+        if b_m:
+            # this k/v block is valid at query position i
+            p_q = tl.make_block_ptr(q + (bos + i) * HQ * K, (HQ, K), (K, 1), (i_h * G + i_g, 0), (1, BK), (1,0))
+            p_lse = tl.make_block_ptr(lse + (bos + i) * HQ, (HQ,), (1,), (i_h * G + i_g,), (1,), (0,))
+            p_delta = tl.make_block_ptr(delta + (bos + i) * HQ, (HQ,), (1,), (i_h * G + i_g,), (1,), (0,))
+            p_do = tl.make_block_ptr(do + (bos + i) * HQ*V, (HQ, V), (V, 1), (i_h * G + i_g, i_v * BV), (1, BV), (1, 0))
+
+            b_q = tl.load(p_q, boundary_check=(0,1)) # [1, BK]
+            b_lse = tl.load(p_lse, boundary_check=(0,)) # [1,]
+            b_delta = tl.load(p_delta, boundary_check=(0,)) # [1,]
+            b_do = tl.load(p_do, boundary_check=(0,1)) # [1, BV]
+
+            b_s = tl.dot(b_k, tl.trans(b_q)) * scale # [BS, 1]
+            b_p = tl.exp(b_s - b_lse[None, :])
+            b_p = tl.where((o_s <= i)[:, None], b_p, 0)
+            b_dp = tl.dot(b_v, tl.trans(b_do)) # [BS, 1]
+            b_ds = b_p * (b_dp - b_delta[None, :]) # [BS, 1]
+
+            b_dv += tl.dot(b_p.to(b_do.dtype), b_do)
+            b_dk += tl.dot(b_ds.to(b_q.dtype), b_q) # [BS, BK]
+    
+    b_dk *= scale
+    
+    tl.store(p_dk, b_dk.to(p_dk.dtype.element_ty), boundary_check=(0,1))
+    tl.store(p_dv, b_dv.to(p_dv.dtype.element_ty), boundary_check=(0,1))
