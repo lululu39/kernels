@@ -517,3 +517,57 @@ def moba_bwd_kernel_dkv(
     
     tl.store(p_dk, b_dk.to(p_dk.dtype.element_ty), boundary_check=(0,1))
     tl.store(p_dv, b_dv.to(p_dv.dtype.element_ty), boundary_check=(0,1))
+
+
+def moba_fwd(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    block_indices: torch.LongTensor,
+    block_counts: torch.LongTensor | int,
+    block_size: int,
+    scale: float,
+    cu_seqlens: torch.LongTensor | None = None,
+    token_indices: torch.LongTensor | None = None, 
+):
+    
+    B, T, HQ, K, H, V, S = *q.shape, k.shape[-2], v.shape[-1], block_indices.shape[-1]
+    G = HQ // H
+    BS = block_size
+
+    BK = min(128, triton.next_power_of_2(K)) # generally we do not split K
+    BV = min(128, triton.next_power_of_2(V))
+
+    NK = triton.cdiv(K, BK)
+    NV = triton.cdiv(V, BV)
+
+    assert NK == 1, "The key dimension can not be larger than 256"
+
+    o = torch.empty(B, T, HQ, V, dtype=v.dtype, device=q.device)
+    lse = torch.empty(B, T, HQ, dtype=torch.float, device=q.device) # NOTE: use float, and is of HQ!
+
+    grid = (T, NV, B * HQ) 
+    moba_fwd_kernel[grid](
+        q=q,
+        k=k,
+        v=v,
+        o=o,
+        lse=lse,
+        scale=scale,
+        block_indices=block_indices,
+        block_counts=block_counts,
+        cu_seqlens=cu_seqlens,
+        token_indices=token_indices,
+        T=T,
+        H=H,
+        HQ=HQ,
+        G=G,
+        K=K,
+        V=V,
+        S=S,
+        BS=BS,
+        BK=BK,
+        BV=BV,
+    )
+
+    return o, lse
