@@ -490,7 +490,7 @@ def moba_bwd_kernel_dkv(
     o_s = tl.arange(0, BS) + i_s * BS
 
     for i in tl.range(i_s * BS, T):
-        b_m = tl.load(block_mask + (bos + i) * H * M + i_h * M + i_s)
+        b_m = tl.load(block_mask + (bos + i) * HQ * M + (i_h * G + i_g) * M + i_s)
 
         if b_m:
             # this k/v block is valid at query position i
@@ -571,3 +571,29 @@ def moba_fwd(
     )
 
     return o, lse
+
+def moba_block_mask(
+    block_indices: torch.LongTensor,
+    block_counts: torch.LongTensor | int,
+    cu_seqlens: torch.LongTensor,
+    block_size: int,
+):
+    B, T, HQ, S = block_indices.shape
+    BS = block_size
+    if cu_seqlens is not None:
+        NS = triton.cdiv(prepare_lens(cu_seqlens).max().item(), BS)
+    else:
+        NS = triton.cdiv(T, BS)
+    block_mask = torch.zeros(B, T, HQ, NS, dtype=torch.bool, device=block_indices.device)
+
+    moba_kernel_block_mask[(B, T, HQ * S)](
+        block_indices=block_indices,
+        block_counts=block_counts,
+        block_mask=block_mask,
+        HQ=HQ,
+        S=S,
+        T=T,
+        BS=BS,
+        NS=NS,
+    )
+    return block_mask
