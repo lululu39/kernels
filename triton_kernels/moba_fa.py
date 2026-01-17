@@ -28,7 +28,7 @@ def calculate_chunks(
     chunk_sizes[cu_num_chunk[1:]] = batch_last_chunk_size
     cu_chunk = chunk_sizes.cumsum(dim=0, dtype=torch.int32) # offset for each chunk
     chunk_to_batch = torch.zeros(
-        (num_chunk,), dtype=torch.int32, dtype=cu_seqlen.device
+        (num_chunk,), dtype=torch.int32, device=cu_seqlen.device
     )
     chunk_to_batch[cu_num_chunk[1:-1]] = 1
     chunk_to_batch = chunk_to_batch.cumsum(dim=0, dtype=torch.int32)

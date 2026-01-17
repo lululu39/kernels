@@ -140,6 +140,48 @@ def moba_topk_kernel(
     p_b = tl.make_block_ptr(block_indices + (bos + i_t) * HQ * S, (HQ * S,), (1,), (i_hq * S,), (S,), (0,))
     tl.store(p_b, b_top.to(p_b.dtype.element_ty))
 
+def moba_topk(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    block_counts: torch.LongTensor | int,
+    block_size: int = 64,
+    scale: float = None,
+    cu_seqlens: torch.LongTensor | None = None
+):
+    B, T, HQ, K, H = *q.shape, k.shape[-2]
+    G = HQ // H
+    S = block_counts if isinstance(block_counts, int) else block_counts.max().item()
+    S = triton.next_power_of_2(S) # NOTE: triton requires us to do so
+    BC = BS = block_size
+    BK = max(triton.next_power_of_2(K), 16)
+    assert BC >= 2 * S, f"BC ({BC}) must be greater than or equal to 2 * S ({S})"
+
+    block_indices = torch.zeros(B, T, HQ, S, dtype=torch.int32, device=q.device)
+
+    token_indices = prepare_token_indices(cu_seqlens) if cu_seqlens is not None else None
+    chunk_offsets = prepare_chunk_offsets(cu_seqlens, BS) if cu_seqlens is not None else None
+
+    grid = (T, B * HQ)
+    moba_topk_kernel[grid](
+        q=q,
+        k=k,
+        scale=scale,
+        block_indices=block_indices,
+        cu_seqlens=cu_seqlens,
+        token_indices=token_indices,
+        chunk_offsets=chunk_offsets,
+        T=T,
+        H=H,
+        HQ=HQ,
+        G=G,
+        K=K,
+        S=S,
+        BC=BC,
+        BS=BS,
+        BK=BK,
+    )
+    return block_indices
+
 
 @triton.heuristics({
     'IS_VARLEN': lambda args: args['cu_seqlens'] is not None,
@@ -479,7 +521,7 @@ def moba_bwd_kernel_dkv(
 
     # NOTE: k needs an extra NV dimension
     p_dk = tl.make_block_ptr(dk + ((i_vg * all + bos) * H + i_h) * K, (T, K), (H * K, 1), (i_s * BS, 0), (BS, BK), (1,0))
-    p_dv = tl.make_block_ptr(dv + ((i_v * all + bos) * H + i_h) * V, (T, V), (H * V, 1), (i_s * BS, i_v * BV), (BS, BV), (1,0))
+    p_dv = tl.make_block_ptr(dv + ((i_g * all + bos) * H + i_h) * V, (T, V), (H * V, 1), (i_s * BS, i_v * BV), (BS, BV), (1,0))
 
     b_k = tl.load(p_k, boundary_check=(0,1)) # [BS, BK]
     b_v = tl.load(p_v, boundary_check=(0,1)) # [BS, BV]
@@ -597,3 +639,192 @@ def moba_block_mask(
         NS=NS,
     )
     return block_mask
+
+
+def moba_bwd(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    o: torch.Tensor,
+    do: torch.Tensor,
+    lse: torch.Tensor,
+    block_indices: torch.LongTensor, # obtained with top-k
+    block_counts: torch.LongTensor | int,
+    block_size: int,
+    scale: float,
+    cu_seqlens: torch.LongTensor | None = None,
+    token_indices: torch.LongTensor | None = None, # used for varlen 
+):
+    B, T, HQ, K, H, V, S = *q.shape, k.shape[-2], v.shape[-1], block_indices.shape[-1]
+    G = HQ // H
+    BS = block_size
+    BK = max(triton.next_power_of_2(K), 16)
+    BV = min(128, max(triton.next_power_of_2(v.shape[-1]), 16)) # again, split v, not k
+
+    NV = triton.cdiv(V, BV)
+    
+    delta = preprocess(o, do)
+
+    dq = torch.empty(NV, *q.shape, dtype=q.dtype if NV == 1 else torch.float, device=q.device)
+    grid = (T, NV, B * HQ)
+    moba_bwd_kernel_dq[grid](
+        q=q,
+        k=k,
+        v=v,
+        lse=lse,
+        delta=delta,
+        do=do,
+        dq=dq,
+        block_indices=block_indices,
+        block_counts=block_counts,
+        cu_seqlens=cu_seqlens,
+        token_indices=token_indices,
+        scale=scale,
+        T=T,
+        B=B,
+        H=H,
+        HQ=HQ,
+        G=G,
+        K=K,
+        V=V,
+        S=S,
+        BS=BS,
+        BK=BK,
+        BV=BV,
+    )
+
+    dq = dq.sum(0)
+
+    if cu_seqlens is not None:
+        chunk_indices = prepare_chunk_indices(cu_seqlens, BS)
+        NS = len(chunk_indices)
+    else:
+        chunk_indices = None
+        NS = triton.cdiv(T, BS)
+
+    grid = (NS, NV * G, B * H)
+
+    block_mask = moba_block_mask(block_indices=block_indices, block_counts=block_counts, cu_seqlens=cu_seqlens, block_size=block_size)
+
+    dk = torch.empty(NV * G, *k.shape, dtype=k.dtype if NV == 1 else torch.float, device=q.device)
+    dv = torch.empty(G, *v.shape, dtype=v.dtype, device=q.device)
+
+    moba_bwd_kernel_dkv[grid](
+        q=q,
+        k=k,
+        v=v,
+        lse=lse,
+        delta=delta,
+        do=do,
+        dk=dk,
+        dv=dv,
+        block_mask=block_mask,
+        cu_seqlens=cu_seqlens,
+        chunk_indices=chunk_indices,
+        scale=scale,
+        T=T,
+        B=B,
+        H=H,
+        HQ=HQ,
+        G=G,
+        K=K,
+        V=V,
+        M=block_mask.shape[-1],
+        BS=BS,
+        BK=BK,
+        BV=BV,
+    )
+
+    dk = dk.sum(0)
+    dv = dv.sum(0)
+
+    return dq, dk, dv
+
+@torch.compile
+class MoBAFunction(torch.autograd.Function):
+
+    @staticmethod
+    @contiguous
+    @autocast_custom_fwd
+    def forward(ctx, q, k, v, block_indices, block_counts, block_size, scale, cu_seqlens):
+        ctx.dtype = q.dtype
+
+        token_indices = prepare_token_indices(cu_seqlens) if cu_seqlens is not None else None
+
+        o, lse = moba_fwd(
+            q=q,
+            k=k,
+            v=v,
+            block_indices=block_indices,
+            block_counts=block_counts,
+            block_size=block_size,
+            scale=scale,
+            cu_seqlens=cu_seqlens,
+            token_indices=token_indices,
+        )
+
+        ctx.save_for_backward(q, k, v, o, lse)
+        ctx.block_indices = block_indices
+        ctx.block_counts = block_counts
+        ctx.cu_seqlens = cu_seqlens
+        ctx.token_indices = token_indices
+        ctx.block_size = block_size
+        ctx.scale = scale
+
+        return o.to(q)
+
+    @staticmethod
+    @contiguous
+    @autocast_custom_bwd
+    def backward(ctx, do):
+        q, k, v, o, lse = ctx.saved_tensors
+        dq, dk, dv = moba_bwd(
+            q=q,
+            k=k,
+            v=v,
+            o=o,
+            lse=lse,
+            do=do,
+            block_indices=ctx.block_indices,
+            block_counts=ctx.block_counts,
+            block_size=ctx.block_size,
+            scale=ctx.scale,
+            cu_seqlens=ctx.cu_seqlens,
+            token_indices=ctx.token_indices,
+        )
+        return dq.to(q), dk.to(k), dv.to(v), None, None, None, None, None
+
+
+def mixture_of_block_attention(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    block_counts: torch.LongTensor | int,
+    block_size: int,
+    scale: float = None,
+    cu_seqlens: torch.LongTensor | None = None,
+):
+    if scale is None:
+        scale = k.shape[-1] ** -0.5
+    
+    k_cmp = my_mean_pooling(k, chunk_size=block_size, cu_seqlens=cu_seqlens)
+
+    block_indices = moba_topk(
+        q=q,
+        k=k_cmp,
+        block_counts=block_counts,
+        block_size=block_size,
+        scale=scale,
+        cu_seqlens=cu_seqlens
+    )
+    
+    return MoBAFunction.apply(
+        q,
+        k,
+        v,
+        block_indices,
+        block_counts,
+        block_size,
+        scale,
+        cu_seqlens
+    )
