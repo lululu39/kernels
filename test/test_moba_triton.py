@@ -3,7 +3,7 @@ import os
 import pytest
 import torch
 
-from triton_kernels.moba_triton import mixture_of_block_attention as tri_moba
+from triton_kernels.moba_triton import mixture_of_block_attention_v1 as tri_moba
 
 from triton_kernels.moba_fa import mixture_of_block_attention as fa_moba
 
@@ -13,8 +13,8 @@ from fla.utils import assert_close, device
     ("B", "T", "block_counts"),
     [
         pytest.param(B, T, bc, id=f"B{B}-T{T}-block_counts{bc}")
-        for B in [1]
-        for T in [1024]
+        for B in [1, 2]
+        for T in [1024, 2048]
         for bc in [4]
     ],
 )
@@ -50,6 +50,12 @@ def test_moba_triton_vs_fa(B: int, T: int, block_counts: int):
     tri_dq, q.grad = q.grad.clone(), None
     tri_dk, k.grad = k.grad.clone(), None
     tri_dv, v.grad = v.grad.clone(), None
+
+    # test which has nan
+    assert not torch.isnan(tri_out).any(), "Triton output has NaN"
+    assert not torch.isnan(tri_dq).any(), "Triton dq has NaN"
+    assert not torch.isnan(tri_dk).any(), "Triton dk has NaN"
+    assert not torch.isnan(tri_dv).any(), "Triton dv has NaN"
 
     # # prepare inputs for fa (flatten batches into varlen sequence)
     # q_fa = q.view(B * T, HQ, K).detach().requires_grad_(True)

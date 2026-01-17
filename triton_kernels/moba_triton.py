@@ -8,6 +8,9 @@ from .pooling import my_mean_pooling
 from .sort import _bitonic_merge, _compare_and_swap # NOTE: we must import rather than directly copy to this file to avoid compilation error
 from fla.ops.attn.parallel import parallel_attn_bwd_preprocess as preprocess
 
+# NOTE: [1, a] x [a, b] / [a, b] x [b, 1] -> tl.sum b_q[:, :, None] * b_k[None, :, :]
+# NOTE: [a, 1] x [1, b] -> directly *
+
 @triton.heuristics({
     'IS_VARLEN': lambda args: args['cu_seqlens'] is not None,
 })
@@ -19,7 +22,7 @@ from fla.ops.attn.parallel import parallel_attn_bwd_preprocess as preprocess
     key=['BS', 'BK'],
 )
 @triton.jit
-def moba_topk_kernel(
+def moba_v1_topk_kernel(
     q,
     k, # compressed
     scale,
@@ -79,7 +82,7 @@ def moba_topk_kernel(
 
         b_k = tl.load(p_k, boundary_check=(0,1)) # [BK, BC]
 
-        b_s = tl.dot(b_q, b_k) * scale # [1, BC]
+        b_s = tl.sum(b_q[:, :, None] * b_k[None, :, :], axis=1) * scale # [1, BC]
         b_s = tl.where((o_c < NC)[None, :], b_s, float('-inf'))
 
         b_m, b_mp = tl.maximum(b_m, tl.max(b_s, 1)), b_m
@@ -93,7 +96,7 @@ def moba_topk_kernel(
     if NC == 0:
         b_lse = tl.zeros([1], dtype=tl.float32)
     else:
-        b_lse = b_m + log(b_acc)
+        b_lse = b_m + tl.log(b_acc)
     
     # calculate the topk blocks
 
@@ -110,7 +113,7 @@ def moba_topk_kernel(
 
         b_k = tl.load(p_k, boundary_check=(0,1)) # [BK, BC]
 
-        b_s = tl.dot(b_q, b_k) * scale # [1, BC]
+        b_s = tl.sum(b_q[:, :, None] * b_k[None, :, :], axis=1) * scale # [1, BC]
 
         b_s = tl.where((o_c < NC)[None, :], b_s, float('-inf'))
 
@@ -140,7 +143,7 @@ def moba_topk_kernel(
     p_b = tl.make_block_ptr(block_indices + (bos + i_t) * HQ * S, (HQ * S,), (1,), (i_hq * S,), (S,), (0,))
     tl.store(p_b, b_top.to(p_b.dtype.element_ty))
 
-def moba_topk(
+def moba_v1_topk(
     q: torch.Tensor,
     k: torch.Tensor,
     block_counts: torch.LongTensor | int,
@@ -162,7 +165,7 @@ def moba_topk(
     chunk_offsets = prepare_chunk_offsets(cu_seqlens, BS) if cu_seqlens is not None else None
 
     grid = (T, B * HQ)
-    moba_topk_kernel[grid](
+    moba_v1_topk_kernel[grid](
         q=q,
         k=k,
         scale=scale,
@@ -195,7 +198,7 @@ def moba_topk(
     key=['BS', 'BK', 'BV'],
 )
 @triton.jit
-def moba_fwd_kernel(
+def moba_v1_fwd_kernel(
     q,
     k,
     v,
@@ -272,7 +275,7 @@ def moba_fwd_kernel(
         if i_s <= i_t and i_s >= 0:
             o_s = i_s + tl.arange(0, BS) # a block offset
 
-            p_k = tl.make_block_ptr(K, (K, T), (1, H * K), (0, i_s), (BK, BS), (0, 1))
+            p_k = tl.make_block_ptr(k, (K, T), (1, H * K), (0, i_s), (BK, BS), (0, 1))
 
             p_v = tl.make_block_ptr(v, (T, V), (H * V, 1), (i_s, i_v * BV), (BS, BV), (1,0))
 
@@ -280,9 +283,9 @@ def moba_fwd_kernel(
 
             b_v = tl.load(p_v, boundary_check=(0,1)) # [BS, BV]
 
-            b_s = tl.dot(b_q, b_k) * scale # [1, BS]
+            b_s = tl.sum(b_q[:, :, None] * b_k[None, :, :], axis=1) * scale # [1, BS]
 
-            b_s = tl.where((o_s < i_t)[None, :], b_s, float('-inf'))
+            b_s = tl.where((o_s <= i_t)[None, :], b_s, float('-inf'))
 
             b_m, b_mp = tl.maximum(b_m, tl.max(b_s, 1)), b_m
 
@@ -292,7 +295,8 @@ def moba_fwd_kernel(
 
             b_acc = b_acc * b_r + tl.sum(b_p, 1)
 
-            b_o = b_o * b_r[:, None] + tl.dot(b_p.to(b_v.dtype), b_v) # [1, BV]
+            # b_o = b_o * b_r[:, None] + tl.dot(b_p.to(b_v.dtype), b_v) # [1, BV]
+            b_o = b_o * b_r[:, None] + tl.sum(b_p[:, :, None].to(b_v.dtype) * b_v[None, :, :], axis=1) # [1, BV]
 
     b_o = b_o / b_acc[:, None] # broadcast
     b_m += tl.log(b_acc) # lse
@@ -313,7 +317,7 @@ def moba_fwd_kernel(
     key=['BS', 'BK', 'BV'],
 )
 @triton.jit(do_not_specialize=['T'])
-def moba_bwd_kernel_dq(
+def moba_v1_bwd_kernel_dq(
     q,
     k,
     v,
@@ -400,17 +404,19 @@ def moba_bwd_kernel_dq(
             b_k = tl.load(p_k, boundary_check=(0,1)) # [BK, BS]
             b_v = tl.load(p_v, boundary_check=(0,1)) # [BV, BS]
 
-            b_s = tl.dot(b_q, b_k) * scale
+            b_s = tl.sum(b_q[:, :, None] * b_k[None, :, :], axis=1) * scale
 
             b_p = tl.exp(b_s - b_lse[:, None]) # [1, BS]
 
             b_p = tl.where((o_s <= i_t)[None, :], b_p, 0)
 
-            b_dp = tl.dot(b_do, b_v)
+            # b_dp = tl.dot(b_do, b_v)
+            b_dp = tl.sum(b_do[:, :, None] * b_v[None, :, :], axis=1)
 
             b_ds = b_p * (b_dp.to(tl.float32) - b_delta[:, None]) # [1, BS]
 
-            b_dq += tl.dot(b_ds.to(b_k.dtype), tl.trans(b_k)) # [1, BK]
+            # b_dq += tl.dot(b_ds.to(b_k.dtype), tl.trans(b_k)) # [1, BK]
+            b_dq += tl.sum(b_ds[:, :, None].to(b_k.dtype) * tl.trans(b_k)[None, :, :], axis=1)
         
     
     b_dq *= scale
@@ -422,7 +428,7 @@ def moba_bwd_kernel_dq(
     'USE_BLOCK_COUNTS': lambda args: isinstance(args['block_counts'], torch.Tensor)
 })
 @triton.jit(do_not_specialize=['T'])
-def moba_kernel_block_mask(
+def moba_v1_kernel_block_mask(
     block_indices,
     block_counts,
     block_mask,
@@ -467,7 +473,7 @@ def moba_kernel_block_mask(
     key=['BS', 'BK', 'BV'],
 )
 @triton.jit(do_not_specialize=['T'])
-def moba_bwd_kernel_dkv(
+def moba_v1_bwd_kernel_dkv(
     q,
     k,
     v,
@@ -546,14 +552,21 @@ def moba_bwd_kernel_dkv(
             b_delta = tl.load(p_delta, boundary_check=(0,)) # [1,]
             b_do = tl.load(p_do, boundary_check=(0,1)) # [1, BV]
 
-            b_s = tl.dot(b_k, tl.trans(b_q)) * scale # [BS, 1]
+            # b_s = tl.dot(b_k, tl.trans(b_q)) * scale # [BS, 1]
+            # b_s = tl.sum(b_k[:, :, None] * tl.trans(b_q)[None, :, :], axis=1) * scale
+            b_s = tl.sum(b_k * b_q, axis=1)[:, None] * scale
             b_p = tl.exp(b_s - b_lse[None, :])
             b_p = tl.where((o_s <= i)[:, None], b_p, 0)
-            b_dp = tl.dot(b_v, tl.trans(b_do)) # [BS, 1]
+            # b_dp = tl.dot(b_v, tl.trans(b_do)) # [BS, 1]
+            b_dp = tl.sum(b_v * b_do, axis=1)[:, None]
             b_ds = b_p * (b_dp - b_delta[None, :]) # [BS, 1]
 
-            b_dv += tl.dot(b_p.to(b_do.dtype), b_do)
-            b_dk += tl.dot(b_ds.to(b_q.dtype), b_q) # [BS, BK]
+            # b_dv += tl.dot(b_p.to(b_do.dtype), b_do)
+            # b_dv += tl.sum(b_p[:, :, None].to(b_do.dtype) * b_do[None, :, :], axis=1)
+            b_dv += b_p.to(b_do.dtype) * b_do
+            # b_dk += tl.dot(b_ds.to(b_q.dtype), b_q) # [BS, BK]
+            # b_dk += tl.sum(b_ds[:, :, None].to(b_q.dtype) * b_q[None, :, :], axis=1)
+            b_dk += b_ds.to(b_q.dtype) * b_q
     
     b_dk *= scale
     
@@ -561,7 +574,7 @@ def moba_bwd_kernel_dkv(
     tl.store(p_dv, b_dv.to(p_dv.dtype.element_ty), boundary_check=(0,1))
 
 
-def moba_fwd(
+def moba_v1_fwd(
     q: torch.Tensor,
     k: torch.Tensor,
     v: torch.Tensor,
@@ -589,7 +602,7 @@ def moba_fwd(
     lse = torch.empty(B, T, HQ, dtype=torch.float, device=q.device) # NOTE: use float, and is of HQ!
 
     grid = (T, NV, B * HQ) 
-    moba_fwd_kernel[grid](
+    moba_v1_fwd_kernel[grid](
         q=q,
         k=k,
         v=v,
@@ -614,7 +627,7 @@ def moba_fwd(
 
     return o, lse
 
-def moba_block_mask(
+def moba_v1_block_mask(
     block_indices: torch.LongTensor,
     block_counts: torch.LongTensor | int,
     cu_seqlens: torch.LongTensor,
@@ -628,7 +641,7 @@ def moba_block_mask(
         NS = triton.cdiv(T, BS)
     block_mask = torch.zeros(B, T, HQ, NS, dtype=torch.bool, device=block_indices.device)
 
-    moba_kernel_block_mask[(B, T, HQ * S)](
+    moba_v1_kernel_block_mask[(B, T, HQ * S)](
         block_indices=block_indices,
         block_counts=block_counts,
         block_mask=block_mask,
@@ -641,7 +654,7 @@ def moba_block_mask(
     return block_mask
 
 
-def moba_bwd(
+def moba_v1_bwd(
     q: torch.Tensor,
     k: torch.Tensor,
     v: torch.Tensor,
@@ -667,7 +680,7 @@ def moba_bwd(
 
     dq = torch.empty(NV, *q.shape, dtype=q.dtype if NV == 1 else torch.float, device=q.device)
     grid = (T, NV, B * HQ)
-    moba_bwd_kernel_dq[grid](
+    moba_v1_bwd_kernel_dq[grid](
         q=q,
         k=k,
         v=v,
@@ -704,12 +717,12 @@ def moba_bwd(
 
     grid = (NS, NV * G, B * H)
 
-    block_mask = moba_block_mask(block_indices=block_indices, block_counts=block_counts, cu_seqlens=cu_seqlens, block_size=block_size)
+    block_mask = moba_v1_block_mask(block_indices=block_indices, block_counts=block_counts, cu_seqlens=cu_seqlens, block_size=block_size)
 
     dk = torch.empty(NV * G, *k.shape, dtype=k.dtype if NV == 1 else torch.float, device=q.device)
     dv = torch.empty(G, *v.shape, dtype=v.dtype, device=q.device)
 
-    moba_bwd_kernel_dkv[grid](
+    moba_v1_bwd_kernel_dkv[grid](
         q=q,
         k=k,
         v=v,
@@ -741,7 +754,7 @@ def moba_bwd(
     return dq, dk, dv
 
 @torch.compile
-class MoBAFunction(torch.autograd.Function):
+class MoBAV1Function(torch.autograd.Function):
 
     @staticmethod
     @contiguous
@@ -751,7 +764,7 @@ class MoBAFunction(torch.autograd.Function):
 
         token_indices = prepare_token_indices(cu_seqlens) if cu_seqlens is not None else None
 
-        o, lse = moba_fwd(
+        o, lse = moba_v1_fwd(
             q=q,
             k=k,
             v=v,
@@ -778,7 +791,7 @@ class MoBAFunction(torch.autograd.Function):
     @autocast_custom_bwd
     def backward(ctx, do):
         q, k, v, o, lse = ctx.saved_tensors
-        dq, dk, dv = moba_bwd(
+        dq, dk, dv = moba_v1_bwd(
             q=q,
             k=k,
             v=v,
@@ -795,7 +808,7 @@ class MoBAFunction(torch.autograd.Function):
         return dq.to(q), dk.to(k), dv.to(v), None, None, None, None, None
 
 
-def mixture_of_block_attention(
+def mixture_of_block_attention_v1(
     q: torch.Tensor,
     k: torch.Tensor,
     v: torch.Tensor,
@@ -809,7 +822,7 @@ def mixture_of_block_attention(
     
     k_cmp = my_mean_pooling(k, chunk_size=block_size, cu_seqlens=cu_seqlens)
 
-    block_indices = moba_topk(
+    block_indices = moba_v1_topk(
         q=q,
         k=k_cmp,
         block_counts=block_counts,
@@ -818,7 +831,7 @@ def mixture_of_block_attention(
         cu_seqlens=cu_seqlens
     )
     
-    return MoBAFunction.apply(
+    return MoBAV1Function.apply(
         q,
         k,
         v,
