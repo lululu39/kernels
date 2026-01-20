@@ -6,6 +6,7 @@ import tilelang.language as tl
 import argparse
 import itertools
 from functools import partial
+from flash_attn.flash_attn_interface import _flash_attn_forward
 
 # get all posible configs
 def get_configs():
@@ -30,8 +31,8 @@ def flash_attn_fwd_bshd(
     num_stages=1,
     threads=128,
 ):
-    # scale = (1.0 / D) ** 0.5 * 1.4426950216 # log2(e)
-    scale = (1.0 / D) ** 0.5 
+    scale = (1.0 / D) ** 0.5 * 1.4426950216 # log2(e)
+    # scale = (1.0 / D) ** 0.5 
     shape = [B, T, H, D]
     dtype = tl.float16
     accum_dtype = tl.float32
@@ -119,11 +120,11 @@ def flash_attn_fwd_bshd(
                     b_m[i] = tl.max(b_m[i], b_mp[i])
 
                 for i in tl.Parallel(BT):
-                    b_r[i] = tl.exp(b_mp[i] - b_m[i])
+                    b_r[i] = tl.exp2(b_mp[i] - b_m[i])
 
                 # for b_q, we reuse b_s buffer
                 for i, j in tl.Parallel(BT, BS):
-                    b_s[i, j] = tl.exp(b_s[i, j] - b_m[i])
+                    b_s[i, j] = tl.exp2(b_s[i, j] - b_m[i])
 
                 
                 tl.reduce_sum(b_s, b_p_sum, dim=1)
@@ -145,7 +146,7 @@ def flash_attn_fwd_bshd(
             
             for i in tl.Parallel(BT):
                 # no matter in log2 or loge, we all use this calculation
-                b_m[i] = b_m[i] + tl.log(b_acc[i])
+                b_m[i] = b_m[i] + tl.log2(b_acc[i])
             
             # register to HBM
             # NOTE: tilelang will automatically inject boundary check based on the index and the shape
@@ -165,7 +166,7 @@ def ref_attn_fwd_bshd(Q, K, V, causal):
         scores = scores.masked_fill(mask == 0, float("-inf"))
     attention_weights = F.softmax(scores, dim=-1)
     output = torch.einsum("bhqk,bkhd->bqhd", attention_weights, V)
-    lse = torch.logsumexp(scores, dim=-1) 
+    lse = torch.logsumexp(scores, dim=-1) * 1.4426950216 # log2(exp sum)
     lse = lse.permute(0, 2, 1).to(torch.float32) # (B, H, T) -> (B, T, H)
     return output, lse
 
