@@ -19,7 +19,7 @@ def get_configs():
         tilelang.PassConfigKey.TL_ENABLE_FAST_MATH: True,
     },
 )
-def flash_attn_mha_fwd_bshd(
+def flash_attn_fwd_bshd(
     B,
     H,
     T,
@@ -30,7 +30,8 @@ def flash_attn_mha_fwd_bshd(
     num_stages=1,
     threads=128,
 ):
-    scale = (1.0 / D) ** 0.5 * 1.4426950216 # log2(e)
+    # scale = (1.0 / D) ** 0.5 * 1.4426950216 # log2(e)
+    scale = (1.0 / D) ** 0.5 
     shape = [B, T, H, D]
     dtype = tl.float16
     accum_dtype = tl.float32
@@ -56,12 +57,7 @@ def flash_attn_mha_fwd_bshd(
             b_k = tl.alloc_shared([BS, D], dtype)
             b_v = tl.alloc_shared([BS, D], dtype)
 
-            # b_o need writing, so we distinct the memory
-            # NOTE: FIXME: tilelang tl.copy may only accept two neigboring memory layout
-            b_o_shared = tl.alloc_shared([BT, D], dtype)
             b_o = tl.alloc_fragment([BT, D], accum_dtype)
-
-            b_lse = tl.alloc_shared([BT], accum_dtype)
             b_m = tl.alloc_fragment([BT], accum_dtype)
             b_acc = tl.alloc_fragment([BT], accum_dtype)
             b_mp = tl.alloc_fragment([BT], accum_dtype)
@@ -71,8 +67,13 @@ def flash_attn_mha_fwd_bshd(
             b_lse = tl.alloc_fragment([BT], accum_dtype)
             b_p_sum = tl.alloc_fragment([BT], accum_dtype)
 
-            # NOTE: no explicit boundary check like in triton
+            # NOTE: no explicit boundary check like in triton, but automatically generated
             tl.copy(q[i_b, i_t * BT : (i_t + 1) * BT, i_h, :], b_q)
+
+            # NOTE: scale is a elementwise op, so we use tl.Parallel
+            for i, j in tl.Parallel(BT, D):
+                b_q[i, j] *= scale
+
             tl.fill(b_o, 0)
             tl.fill(b_acc, 0)
             tl.fill(b_m, -tl.infinity(accum_dtype)) # -inf
@@ -81,22 +82,34 @@ def flash_attn_mha_fwd_bshd(
                 tl.min(NS, tl.ceildiv((i_t + 1) * BT, BS)) if causal else NS
             )
 
-            for k in tl.Pipelined(loop_range, num_stages=num_stages):
-                tl.copy(k[i_b, k * BS: (k + 1) * BS, i_h, :], b_k)
-                tl.copy(v[i_b, k * BS: (k + 1) * BS, i_h, :], b_v)
+            for i_s in tl.Pipelined(loop_range, num_stages=num_stages):
+                tl.copy(k[i_b, i_s * BS: (i_s + 1) * BS, i_h, :], b_k)
+                tl.copy(v[i_b, i_s * BS: (i_s + 1) * BS, i_h, :], b_v)
 
-                # tl.gemm requires A @ B = C, where the output is added to C rather than assigned.
-                # NOTE: in tilelang, we use tl.parallel for element-wise function
+                # NOTE: we can also pre-mask b_s as below to save a tl.clear op
 
-                if causal:
-                    for i, j in tl.Parallel(BT, BS):
-                        b_s[i, j] = tl.if_then_else(i_t * BT + i >= k * BS + k, 0, -tl.infinity(b_s.dtype))
-                else:
-                    for i, j in tl.Parallel(BT, BS):
-                        b_s[i, j] = tl.if_then_else(k * BS + k <= T, 0, -tl.infinity(b_s.dtype))
+                # if causal:
+                #     for i, j in tl.Parallel(BT, BS):
+                #         b_s[i, j] = tl.if_then_else(i_t * BT + i >= i_s * BS + j, 0, -tl.infinity(b_s.dtype))
+                # else:
+                #     for i, j in tl.Parallel(BT, BS):
+                #         b_s[i, j] = tl.if_then_else(i_s * BS + j < T, 0, -tl.infinity(b_s.dtype))
                 
                 # the warps are parallized across rows
+
+                tl.clear(b_s) # NOTE: not used if we pre-mask
+
+                # NOTE: tl.gemm requires A @ B = C, where the output is added to C rather than assigned.
+
                 tl.gemm(b_q, b_k, b_s, transpose_B=True, policy=tl.GemmWarpPolicy.FullRow)
+
+                # NOTE: in tilelang, we use tl.parallel for element-wise function
+                if causal:
+                    for i, j in tl.Parallel(BT, BS):
+                        b_s[i, j] = tl.if_then_else(i_t * BT + i >= i_s * BS + j, b_s[i, j], -tl.infinity(b_s.dtype))
+                else:
+                    for i, j in tl.Parallel(BT, BS):
+                        b_s[i, j] = tl.if_then_else(i_s * BS + j < T, b_s[i, j], -tl.infinity(b_s.dtype))
 
                 tl.copy(b_m, b_mp)
 
@@ -104,15 +117,13 @@ def flash_attn_mha_fwd_bshd(
 
                 for i in tl.Parallel(BT):
                     b_m[i] = tl.max(b_m[i], b_mp[i])
-                
-                # NOTE: scale is a scalar and thus moved to elementwise function
 
                 for i in tl.Parallel(BT):
-                    b_r[i] = tl.exp2(b_mp[i] * scale - b_m[i] * scale)
+                    b_r[i] = tl.exp(b_mp[i] - b_m[i])
 
                 # for b_q, we reuse b_s buffer
                 for i, j in tl.Parallel(BT, BS):
-                    b_s[i, j] = tl.exp2(b_s[i, j] * scale - b_m[i] * scale)
+                    b_s[i, j] = tl.exp(b_s[i, j] - b_m[i])
 
                 
                 tl.reduce_sum(b_s, b_p_sum, dim=1)
@@ -127,30 +138,79 @@ def flash_attn_mha_fwd_bshd(
                 for i, j in tl.Parallel(BT, BS):
                     b_o[i, j] *= b_r[i]
                 
-                tl.gemm(b_p_cast, b_v, b_o, policy=T.GemmWarpPolicy.FullRow) # [BT, D]
+                tl.gemm(b_p_cast, b_v, b_o, policy=tl.GemmWarpPolicy.FullRow) # [BT, D]
             
             for i, j in tl.Parallel(BT, D):
                 b_o[i, j] /= b_acc[i]
             
             for i in tl.Parallel(BT):
-                b_m[i] += tl.log2(b_acc[i])
+                # no matter in log2 or loge, we all use this calculation
+                b_m[i] = b_m[i] + tl.log(b_acc[i])
             
-            # register to shared mem
-            tl.copy(b_m, b_lse)
-            tl.copy(b_o, b_o_shared)
-
-            # shared mem to HBM
-            tl.copy(b_o_shared, o[i_b, i_t * BT : (i_t + 1) * BT, i_h, :])
-            tl.copy(b_lse, lse[i_b, i_t * BT : (i_t + 1) * BT, i_h])
+            # register to HBM
+            # NOTE: tilelang will automatically inject boundary check based on the index and the shape
+            tl.copy(b_o, o[i_b, i_t * BT : (i_t + 1) * BT, i_h, :])
+            tl.copy(b_m, lse[i_b, i_t * BT : (i_t + 1) * BT, i_h])
     
-
     return main
 
+def ref_attn_fwd_bshd(Q, K, V, causal):
+    dim = Q.size(-1)
+    scores = torch.einsum("bqhd,bkhd->bhqk", Q, K)
+    scores = scores / torch.sqrt(torch.tensor(dim, dtype=scores.dtype))
+    if causal:
+        seq_len = Q.size(1)
+        mask = torch.tril(torch.ones(seq_len, seq_len, device=scores.device))
+        mask = mask.unsqueeze(0).unsqueeze(0)
+        scores = scores.masked_fill(mask == 0, float("-inf"))
+    attention_weights = F.softmax(scores, dim=-1)
+    output = torch.einsum("bhqk,bkhd->bqhd", attention_weights, V)
+    lse = torch.logsumexp(scores, dim=-1) 
+    lse = lse.permute(0, 2, 1).to(torch.float32) # (B, H, T) -> (B, T, H)
+    return output, lse
 
+def test_fwd(
+    batch: int = 8,
+    heads: int = 32,
+    seq_len: int = 4096,
+    dim: int = 128,
+    causal: bool = False,
+    tune: bool = False,
+):
+    flops_per_matmul = 2.0 * batch * heads * seq_len * seq_len * dim
+    total_flops = 2 * flops_per_matmul
+    if causal:
+        total_flops *= 0.5
 
-                
-                
+    if not tune:
+        kernel = flash_attn_fwd_bshd(batch, heads, seq_len, dim, causal, BT=128, BS=128, num_stages=1, threads=128)
+        ref_program_processed = partial(ref_attn_fwd_bshd, causal=causal)
+        profiler = kernel.get_profiler()
+        profiler.assert_allclose(ref_program_processed, rtol=0.01, atol=0.01)
+        print("All checks pass.")
+        latency = profiler.do_bench(ref_program_processed, warmup=500)
+        print("Ref: {:.2f} ms".format(latency))
+        print("Ref: {:.2f} TFlops".format(total_flops / latency * 1e-9))
+        latency = profiler.do_bench(warmup=500)
+        print("Tile-lang: {:.2f} ms".format(latency))
+        print("Tile-lang: {:.2f} TFlops".format(total_flops / latency * 1e-9))
+    else:
+        best_result = flash_attn_fwd_bshd(batch, heads, seq_len, dim, causal)
+        best_latency = best_result.latency
+        best_config = best_result.config
+        ref_latency = best_result.ref_latency
+        print(f"Best latency: {best_latency}")
+        print(f"Best TFlops: {total_flops / best_latency * 1e-9}")
+        print(f"Best config: {best_config}")
+        print(f"Ref latency: {ref_latency}")
 
-
-
-
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--batch", type=int, default=2, help="batch size")
+    parser.add_argument("--heads", type=int, default=16, help="heads")
+    parser.add_argument("--seq_len", type=int, default=4096, help="sequence length")
+    parser.add_argument("--dim", type=int, default=32, help="dim")
+    parser.add_argument("--causal", action="store_true", help="causal")
+    parser.add_argument("--tune", action="store_true", help="tune configs")
+    args = parser.parse_args()
+    test_fwd(args.batch, args.heads, args.seq_len, args.dim, args.causal, args.tune)
