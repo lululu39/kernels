@@ -22,7 +22,9 @@ def get_configs():
 )
 def flash_attn_fwd_bshd(
     B,
+    HQ,
     H,
+    G,
     T,
     D,
     causal=True,
@@ -33,7 +35,8 @@ def flash_attn_fwd_bshd(
 ):
     scale = (1.0 / D) ** 0.5 * 1.4426950216 # log2(e)
     # scale = (1.0 / D) ** 0.5 
-    shape = [B, T, H, D]
+    shape_qo = [B, T, HQ, D]
+    shape_kv = [B, T, H, D]
     dtype = tl.float16
     accum_dtype = tl.float32
 
@@ -42,17 +45,19 @@ def flash_attn_fwd_bshd(
 
     @tl.prim_func
     def main(
-        q: tl.Tensor(shape, dtype), # type: ignore
-        k: tl.Tensor(shape, dtype), # type: ignore
-        v: tl.Tensor(shape, dtype), # type: ignore
-        o: tl.Tensor(shape, dtype), # type: ignore
-        lse: tl.Tensor((B, T, H), accum_dtype), # type: ignore
+        q: tl.Tensor(shape_qo, dtype), # type: ignore
+        k: tl.Tensor(shape_kv, dtype), # type: ignore
+        v: tl.Tensor(shape_kv, dtype), # type: ignore
+        o: tl.Tensor(shape_qo, dtype), # type: ignore
+        lse: tl.Tensor((B, T, HQ), accum_dtype), # type: ignore
     ):
         
-        with tl.Kernel(NT, H, B, threads=threads) as (i_t, i_h, i_b):
+        with tl.Kernel(NT, HQ, B, threads=threads) as (i_t, i_hq, i_b):
             
             # Only read: shared
             # Will write: register
+
+            i_h = i_hq // G
 
             b_q = tl.alloc_shared([BT, D], dtype)
             b_k = tl.alloc_shared([BS, D], dtype)
@@ -65,11 +70,10 @@ def flash_attn_fwd_bshd(
             b_s = tl.alloc_fragment([BT, BS], accum_dtype)
             b_p_cast = tl.alloc_fragment([BT, BS], dtype)
             b_r = tl.alloc_fragment([BT], accum_dtype) # the running scaling factor
-            b_lse = tl.alloc_fragment([BT], accum_dtype)
             b_p_sum = tl.alloc_fragment([BT], accum_dtype)
 
             # NOTE: no explicit boundary check like in triton, but automatically generated
-            tl.copy(q[i_b, i_t * BT : (i_t + 1) * BT, i_h, :], b_q)
+            tl.copy(q[i_b, i_t * BT : (i_t + 1) * BT, i_hq, :], b_q)
 
             # NOTE: scale is a elementwise op, so we use tl.Parallel
             for i, j in tl.Parallel(BT, D):
@@ -102,6 +106,9 @@ def flash_attn_fwd_bshd(
 
                 # NOTE: tl.gemm requires A @ B = C, where the output is added to C rather than assigned.
 
+                # NOTE: tl.gemm or triton's tl.dot WILL output float output, so in tilelang we explicity set the precision 
+                # of output buffer to float.
+
                 tl.gemm(b_q, b_k, b_s, transpose_B=True, policy=tl.GemmWarpPolicy.FullRow)
 
                 # NOTE: in tilelang, we use tl.parallel for element-wise function
@@ -122,7 +129,7 @@ def flash_attn_fwd_bshd(
                 for i in tl.Parallel(BT):
                     b_r[i] = tl.exp2(b_mp[i] - b_m[i])
 
-                # for b_q, we reuse b_s buffer
+                # for b_p, we reuse b_s buffer
                 for i, j in tl.Parallel(BT, BS):
                     b_s[i, j] = tl.exp2(b_s[i, j] - b_m[i])
 
@@ -134,6 +141,8 @@ def flash_attn_fwd_bshd(
                     b_acc[i] = b_acc[i] * b_r[i] + b_p_sum[i]
                 
                 # cast b_p to b_q dtype
+                # NOTE: Create a new buffer to cast layout (Accum -> Operand) and dtype (fp32 -> fp16) for the next GEMM.
+                # NOTE: because GEMM output layout is different from inout layout, and we cannot use the same fragment because the layout mismatch
                 tl.copy(b_s, b_p_cast) # [BT, BS]
 
                 for i, j in tl.Parallel(BT, BS):
@@ -150,10 +159,72 @@ def flash_attn_fwd_bshd(
             
             # register to HBM
             # NOTE: tilelang will automatically inject boundary check based on the index and the shape
-            tl.copy(b_o, o[i_b, i_t * BT : (i_t + 1) * BT, i_h, :])
-            tl.copy(b_m, lse[i_b, i_t * BT : (i_t + 1) * BT, i_h])
+            tl.copy(b_o, o[i_b, i_t * BT : (i_t + 1) * BT, i_hq, :])
+            tl.copy(b_m, lse[i_b, i_t * BT : (i_t + 1) * BT, i_hq])
     
     return main
+
+def flash_attn_bwd_bshd_dq(
+    B,
+    HQ,
+    H,
+    G,
+    T,
+    D,
+    causal=True,
+    BT=64,
+    BS=64,
+    num_stages=1,
+    threads=128,
+):
+    
+    scale = (1.0 / D) ** 0.5 * 1.4426950216 # log2(e)
+    # scale = (1.0 / D) ** 0.5 
+    shape_qo = [B, T, HQ, D]
+    shape_kv = [B, T, H, D]
+    dtype = tl.float16
+    accum_dtype = tl.float32
+
+    NT = tl.ceildiv(T, BT)
+    NS = tl.ceildiv(T, BS) # num iters for kv
+
+    # NOTE: read param first, write param later
+
+    @tl.prim_func
+    def main(
+        q: tl.Tensor(shape_qo, dtype), # type: ignore
+        k: tl.Tensor(shape_kv, dtype), # type: ignore
+        v: tl.Tensor(shape_kv, dtype), # type: ignore
+        do: tl.Tensor(shape_qo, dtype), # type: ignore
+        lse: tl.Tensor((B, T, HQ), accum_dtype), # type: ignore
+        delta: tl.Tensor((B, T, HQ), accum_dtype), # type: ignore
+        dq: tl.Tensor(shape_qo, dtype), # type: ignore
+    ):
+        
+        with tl.Kernel(NT, HQ, B, threads=threads) as (i_t, i_hq, i_b):
+
+            # Only read: shared
+            # Will write: register
+
+            i_h = i_hq // G
+
+            b_q = tl.alloc_shared([BT, D], dtype)
+            b_k = tl.alloc_shared([BS, D], dtype)
+            b_v = tl.alloc_shared([BS, D], dtype)
+            b_do = tl.alloc_shared([BT, D], dtype)
+            b_lse = tl.alloc_shared([BT], accum_dtype)
+
+            b_dq = tl.alloc_fragment([BT, D], dtype)
+
+            b_s = tl.alloc_fragment([BT, BS], accum_dtype)
+
+            
+
+        
+
+    
+    
+    
 
 def ref_attn_fwd_bshd(Q, K, V, causal):
     dim = Q.size(-1)
@@ -172,6 +243,7 @@ def ref_attn_fwd_bshd(Q, K, V, causal):
 
 def test_fwd(
     batch: int = 8,
+    heads_q: int = 32,
     heads: int = 32,
     seq_len: int = 4096,
     dim: int = 128,
@@ -184,7 +256,7 @@ def test_fwd(
         total_flops *= 0.5
 
     if not tune:
-        kernel = flash_attn_fwd_bshd(batch, heads, seq_len, dim, causal, BT=128, BS=128, num_stages=1, threads=128)
+        kernel = flash_attn_fwd_bshd(batch, heads_q, heads, heads_q // heads, seq_len, dim, causal, BT=128, BS=128, num_stages=1, threads=128)
         ref_program_processed = partial(ref_attn_fwd_bshd, causal=causal)
         profiler = kernel.get_profiler()
         profiler.assert_allclose(ref_program_processed, rtol=0.01, atol=0.01)
@@ -196,7 +268,7 @@ def test_fwd(
         print("Tile-lang: {:.2f} ms".format(latency))
         print("Tile-lang: {:.2f} TFlops".format(total_flops / latency * 1e-9))
     else:
-        best_result = flash_attn_fwd_bshd(batch, heads, seq_len, dim, causal)
+        best_result = flash_attn_fwd_bshd(batch, heads_q, heads, heads_q // heads, seq_len, dim, causal)
         best_latency = best_result.latency
         best_config = best_result.config
         ref_latency = best_result.ref_latency
@@ -205,13 +277,16 @@ def test_fwd(
         print(f"Best config: {best_config}")
         print(f"Ref latency: {ref_latency}")
 
+
+
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--batch", type=int, default=2, help="batch size")
     parser.add_argument("--heads", type=int, default=16, help="heads")
+    parser.add_argument("--groups", type=int, default=1, help="groups")
     parser.add_argument("--seq_len", type=int, default=4096, help="sequence length")
     parser.add_argument("--dim", type=int, default=32, help="dim")
     parser.add_argument("--causal", action="store_true", help="causal")
     parser.add_argument("--tune", action="store_true", help="tune configs")
     args = parser.parse_args()
-    test_fwd(args.batch, args.heads, args.seq_len, args.dim, args.causal, args.tune)
+    test_fwd(args.batch, args.heads * args.groups, args.heads, args.seq_len, args.dim, args.causal, args.tune)
