@@ -164,6 +164,62 @@ def flash_attn_fwd_bshd(
     
     return main
 
+@tilelang.jit(
+    out_idx=[2],
+    pass_configs={
+        tilelang.PassConfigKey.TL_ENABLE_FAST_MATH: True,
+    },
+)
+def flash_attn_bwd_bshd_preprocess(
+    B,
+    HQ,
+    T,
+    D,
+    BTD,
+):
+    dtype = tl.float16
+    accum_dtype = tl.float32
+    shape = [B, T, HQ, D]
+
+    @tl.prim_func
+    def main(
+        o: tl.Tensor(shape, dtype), # type: ignore
+        do: tl.Tensor(shape, dtype), # type: ignore
+        delta: tl.Tensor([B, T, HQ], accum_dtype), # type: ignore
+    ):
+        
+        with tl.Kernel(B, tl.ceildiv(T, BTD), HQ) as (i_b, i_t, i_hq):
+
+            # b_o = tl.alloc_shared([BTD, BTD], dtype)
+            # b_do = tl.alloc_shared([BTD, BTD], dtype)
+            # NOTE: FIXME: i think it is best to put all vars in register, but 
+            # in fwd we are constrained by the register size
+            # now, the BTD is small so we directly use register mem
+
+            b_o = tl.alloc_fragment([BTD, BTD], dtype)
+            b_do = tl.alloc_fragment([BTD, BTD], dtype)
+            b_acc = tl.alloc_fragment([BTD, BTD], accum_dtype)
+            b_delta = tl.alloc_fragment([BTD], accum_dtype)
+
+            tl.clear(b_acc)
+
+            for k in range(tl.ceildiv(D, BTD)):
+                tl.copy(o[i_b, i_t * BTD : (i_t + 1) * BTD, i_hq, k * BTD : (k + 1) * BTD], b_o)
+                tl.copy(do[i_b, i_t * BTD : (i_t + 1) * BTD, i_hq, k * BTD : (k + 1) * BTD], b_do)
+                
+                for i, j in tl.Parallel(BTD, BTD):
+                    b_acc[i, j] += b_o[i, j] * b_do[i, j]
+            
+            tl.reduce_sum(b_acc, b_delta, dim=1) # [BTD,]
+
+            tl.copy(b_delta, delta[i_b, i_t * BTD: (i_t + 1) * BTD, i_hq])
+
+    return main
+
+
+        
+    
+
 def flash_attn_bwd_bshd_dq(
     B,
     HQ,
@@ -219,9 +275,6 @@ def flash_attn_bwd_bshd_dq(
             b_s = tl.alloc_fragment([BT, BS], accum_dtype)
 
             
-
-        
-
     
     
     
