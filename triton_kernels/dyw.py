@@ -7,7 +7,7 @@ import math
 from fla.utils import autocast_custom_bwd, autocast_custom_fwd, check_shared_mem, contiguous
 
 @torch.compile
-def torch_dyw_fwd(
+def torch_dyw(
     x: torch.Tensor,
     a: torch.Tensor,
     b: torch.Tensor,
@@ -22,14 +22,11 @@ def torch_dyw_fwd(
     b = b.view(R, K, -1)  # [R, K, D]
     w = torch.matmul(x, r)  # [B, T, K]
     h = torch.einsum('bsd,kdr->kbsr', x, a)
-    y = torch.einsum('kbsr,krd->kbsd', h, b)
+    y = torch.einsum('kbsr,rkd->kbsd', h, b)
     y = torch.einsum('bsk,kbsd->bsd', w.softmax(dim=-1), y)
 
     return y
 
-@triton.heuristics({
-    'HAS_SCORE': lambda args: args['score'] is not None,
-})
 @triton.jit
 def triton_dyw_fwd_kernel(
     x,
@@ -37,9 +34,8 @@ def triton_dyw_fwd_kernel(
     a,
     b,
     r,
-    score,
     B: tl.constexpr,
-    T: tl.constexpr,
+    S: tl.constexpr,
     M: tl.constexpr,
     N: tl.constexpr,
     D: tl.constexpr,
@@ -48,22 +44,42 @@ def triton_dyw_fwd_kernel(
     BS: tl.constexpr,
     BM: tl.constexpr,
     BN: tl.constexpr,
-    HAS_SCORE: tl.constexpr,
 ):
     
-    # x: [B, T, M] [S, M]
+    # x: [B, S, M]
+    # r: [M, K]
     # a: [KMD, R] [M, R]
     # b: [R, KND] [R, N]
-    # y: [B, T, N] [S, N]
+    # y: [B, S, N]
 
-    i_s, i_n = tl.program_id(0), tl.program_id(1)
+    i_b, i_s, i_n = tl.program_id(0), tl.program_id(1), tl.program_id(2)
+
+    # x @ r -> s [BS, M] [M, K] -> [BS, K]
+
+    b_s = tl.zeros([BS, K], dtype=tl.float32)
+
+    for i_m in range(0, M, BM):
+        p_x = tl.make_block_ptr(x + i_b * S * M, (S, M), (M, 1), (i_s * BS, i_m * BM), (BS, BM), (1, 0))
+        b_x = tl.load(p_x, boundary_check=(0,1)) # [BS, BM]
+
+        p_r = tl.make_block_ptr(r, (M, K), (K, 1), (i_m * BM, 0), (BM, K), (1, 0))
+        b_r = tl.load(p_r, boundary_check=(0,1))
+
+        b_s += tl.dot(b_x, b_r) # partial sum [BS, K]
+
+    # softmax to get actual score
+    b_m = tl.max(b_s, 1) # [BS]
+    b_s = tl.exp(b_s - b_m[:, None])
+    b_sum = tl.sum(b_s, 1)
+    b_s = b_s / b_sum[:, None]
+        
 
 
 
 backend2impl = {
     # "triton": triton,
     # "tilelang": triton.language,
-    "torch": torch_dyw_fwd,
+    "torch": torch_dyw,
 }
 
 torch.nn.Linear
