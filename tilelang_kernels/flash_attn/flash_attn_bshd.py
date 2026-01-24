@@ -54,7 +54,7 @@ def flash_attn_fwd_bshd(
         
         with tl.Kernel(NT, HQ, B, threads=threads) as (i_t, i_hq, i_b):
             
-            # Only read: shared
+            # Only read and large: shared
             # Will write: register
 
             i_h = i_hq // G
@@ -216,10 +216,8 @@ def flash_attn_bwd_bshd_preprocess(
 
     return main
 
-
         
     
-
 def flash_attn_bwd_bshd_dq(
     B,
     HQ,
@@ -274,8 +272,21 @@ def flash_attn_bwd_bshd_dq(
 
             b_s = tl.alloc_fragment([BT, BS], accum_dtype)
 
-            
-    
+            # copy q and merge scale into q
+            tl.copy(q[i_b, i_t * BT : (i_t + 1) * BT, i_hq, :], b_q)
+
+            for i, j in tl.Parallel(BT, D):
+                b_q[i, j] *= scale
+
+            loop_range = (
+                tl.min(NS, tl.ceildiv((i_t + 1) * BT, BS)) if causal else NS
+            )
+
+            for i_s in tl.Pipelined(loop_range, num_stages=num_stages):
+                tl.copy(k[i_b, i_s * BS: (i_s + 1) * BS, i_h, :], b_k)
+                tl.copy(v[i_b, i_s * BS: (i_s + 1) * BS, i_h, :], b_v)
+
+
     
     
 
