@@ -277,6 +277,8 @@ def flash_attn_bwd_bshd_dq(
 
             for i, j in tl.Parallel(BT, D):
                 b_q[i, j] *= scale
+            
+            tl.copy(lse[i_b, i_t * BT : (i_t + 1) * BT, i_hq], b_lse)
 
             loop_range = (
                 tl.min(NS, tl.ceildiv((i_t + 1) * BT, BS)) if causal else NS
@@ -287,7 +289,17 @@ def flash_attn_bwd_bshd_dq(
                 tl.copy(v[i_b, i_s * BS: (i_s + 1) * BS, i_h, :], b_v)
 
 
-    
+            tl.clear(b_s) # NOTE: not used if we pre-mask
+
+            tl.gemm(b_q, b_k, b_s, transpose_B=True, policy=tl.GemmWarpPolicy.FullRow)
+
+            # directly calculate b_p
+            if causal:
+                for i, j in tl.Parallel(BT, BS):
+                    b_s[i, j] = tl.if_then_else(i_t * BT + i >= i_s * BS + j, tl.exp2(b_s[i, j] - b_lse[i]), 0)
+            else:
+                for i, j in tl.Parallel(BT, BS):
+                    b_s[i, j] = tl.if_then_else(i_s * BS + j < T, tl.exp2(b_s[i, j] - b_lse[i]), 0)
     
 
 def ref_attn_fwd_bshd(Q, K, V, causal):
