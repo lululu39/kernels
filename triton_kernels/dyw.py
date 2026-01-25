@@ -6,6 +6,9 @@ from typing import Any, Tuple
 import math
 from fla.utils import autocast_custom_bwd, autocast_custom_fwd, check_shared_mem, contiguous
 
+
+import torch.nn as nn
+
 @torch.compile
 def torch_dyw(
     x: torch.Tensor,
@@ -15,14 +18,10 @@ def torch_dyw(
     K: int,
     R: int
 ) -> torch.Tensor:
-    """
-    x: torch.Tensor [B, T, D]
-    """
-    a = a.view(K, -1, R)  # [K, D, R]
-    b = b.view(R, K, -1)  # [R, K, D]
+    
     w = torch.matmul(x, r)  # [B, T, K]
     h = torch.einsum('bsd,kdr->kbsr', x, a)
-    y = torch.einsum('kbsr,rkd->kbsd', h, b)
+    y = torch.einsum('kbsr,krd->kbsd', h, b)
     y = torch.einsum('bsk,kbsd->bsd', w.softmax(dim=-1), y)
 
     return y
@@ -38,7 +37,6 @@ def triton_dyw_fwd_kernel(
     S: tl.constexpr,
     M: tl.constexpr,
     N: tl.constexpr,
-    D: tl.constexpr,
     K: tl.constexpr,
     R: tl.constexpr,
     BS: tl.constexpr,
@@ -48,8 +46,8 @@ def triton_dyw_fwd_kernel(
     
     # x: [B, S, M]
     # r: [M, K]
-    # a: [KMD, R] [M, R]
-    # b: [R, KND] [R, N]
+    # a: [K, M, R]
+    # b: [K, R, N]
     # y: [B, S, N]
 
     i_b, i_s, i_n = tl.program_id(0), tl.program_id(1), tl.program_id(2)
@@ -59,7 +57,7 @@ def triton_dyw_fwd_kernel(
     b_s = tl.zeros([BS, K], dtype=tl.float32)
 
     for i_m in range(0, M, BM):
-        p_x = tl.make_block_ptr(x + i_b * S * M, (S, M), (M, 1), (i_s * BS, i_m * BM), (BS, BM), (1, 0))
+        p_x = tl.make_block_ptr(x + i_b * S * M, (S, M), (M, 1), (i_s * BS, i_m * BM), (BS, BM), (1,0))
         b_x = tl.load(p_x, boundary_check=(0,1)) # [BS, BM]
 
         p_r = tl.make_block_ptr(r, (M, K), (K, 1), (i_m * BM, 0), (BM, K), (1, 0))
@@ -71,10 +69,82 @@ def triton_dyw_fwd_kernel(
     b_m = tl.max(b_s, 1) # [BS]
     b_s = tl.exp(b_s - b_m[:, None])
     b_sum = tl.sum(b_s, 1)
-    b_s = b_s / b_sum[:, None]
+    b_s = b_s / b_sum[:, None] # [BS, K]
+
+    # split into k path to calculate x @ a -> h -> h @ b = y
+    # [BS, M] [M, R] -> [BS, R] -> [BS, N]
+
+    p_y = tl.make_block_ptr(y + i_b * S * N, (S, N), (N, 1), (i_s * BS, i_n * BN), (BS, BN), (1,0))
+
+    b_y = tl.zeros([BS, BN], dtype=tl.float32)
+
+    for i_k in range(0, K):
+
+        b_h = tl.zeros([BS, R], dtype=tl.float32)
+        # NOTE: we for loop k, since we do not want to do atmoic add
+
+        # x @ a -> h
+
+        for i_m in range(0, M, BM):
+            p_x = tl.make_block_ptr(x + i_b * S * M, (S, M), (M, 1), (i_s * BS, i_m * BM), (BS, BM), (1, 0))
+            b_x = tl.load(p_x, boundary_check=(0,1)) # [BS, BM]
+
+            p_a = tl.make_block_ptr(a + i_k * M * R, (M, R), (R, 1), (i_m * BM, 0), (BM, R), (1,0))
+            b_a = tl.load(p_a, boundary_check=(0,1))
+
+            b_h += tl.dot(b_x, b_a) # [BM, R]
+
+        p_b = tl.make_block_ptr(b + i_k * R * N, (R, N), (N, 1), (0, i_n * BN), (R, BN), (1, 0))
+
+        b_b = tl.load(p_b, boundary_check=(0,1))
         
+        # score[k] * h @ b
+
+        b_s_k = tl.sum(b_s * (tl.arange(0, K) == i_k)[None, :], axis=1)
+
+        b_y += b_s_k[:, None] * tl.dot(b_h, b_b) # [BS, BN]
+    
+    tl.store(p_y, b_y.to(p_y.dtype.element_ty), boundary_check=(0,1))
 
 
+def triton_dyw_fwd(
+    x: torch.Tensor,
+    a: torch.Tensor,
+    b: torch.Tensor,
+    r: torch.Tensor,
+    K: int,
+    R: int  
+):
+    B, S, M, N = *x.shape, b.shape[-1]
+
+    BS = 128
+
+    BM = 64
+
+    BN = 64
+
+    y = torch.empty(B, S, N, dtype=x.dtype, device=x.device)
+
+    grid = (B, triton.cdiv(S, BS), triton.cdiv(N, BN))
+
+    triton_dyw_fwd_kernel[grid](
+        x=x,
+        y=y,
+        a=a,
+        b=b,
+        r=r,
+        B=B,
+        S=S,
+        M=M,
+        N=N,
+        K=K,
+        R=R,
+        BS=BS,
+        BM=BM,
+        BN=BN,
+    )
+
+    return y
 
 backend2impl = {
     # "triton": triton,
@@ -82,60 +152,26 @@ backend2impl = {
     "torch": torch_dyw,
 }
 
-torch.nn.Linear
-
-class DyWLinear(torch.nn.Module):
-
-    def __init__(
-        self,
-        dim: int,
-        in_scale: int,
-        out_scale: int,
-        K: int,
-        R: int,
-        backend: str = "triton",
-        bias: bool = False,
-        device: Any | None = None,
-        dtype: Any | None = None
-    ):
-        
+class DyWLinear(nn.Module):
+    def __init__(self, dim, r=4, in_s=1, out_s=1, backend="torch"):
         super().__init__()
+        
+        k = int((in_s * out_s * dim) / ((in_s + out_s) * r))
 
-        assert backend in ["triton", "tilelang", "torch"], f"Unsupported backend: {backend}"
-        assert bias is False, "Bias is not supported in DyWLinear."
-        assert R >= 16, "Rank R must be at least 16 for DyWLinear."
+        # k < sqrt(ab * dim / (a + b))
+        # k < r
 
-        assert (K * R) <= ((in_scale * out_scale) / (in_scale + out_scale)), (
-            f"Product of k and r must be less than or equal to "
-            f"(in_scale * out_scale) / (in_scale + out_scale). "
-            f"Got k * r = {K * R}, "
-            f"(in_scale * out_scale) / (in_scale + out_scale) = "
-            f"{(in_scale * out_scale) / (in_scale + out_scale)}."
-        )
+        self.in_dim = dim * in_s
+        self.out_dim = dim * out_s
+        self.K = k
+        self.R = r
 
-        self.in_scale = in_scale # m in formula, M = m * D
-        self.out_scale = out_scale # n in formula
-        self.in_dim = in_scale * dim
-        self.out_dim = out_scale * dim
-        self.dim = dim
-        self.K = K
-        self.R = R
+        self.r = nn.Parameter(torch.randn(self.in_dim, k))
+        self.a = nn.Parameter(torch.randn(k, self.in_dim, r))
+
+        self.b = nn.Parameter(torch.randn(k, r, self.out_dim))
+
         self.backend = backend
-
-        self.r = torch.nn.Parameter(
-            torch.randn(self.in_dim, self.K)
-        )
-
-        self.a = torch.nn.Parameter(
-            torch.randn(K * self.in_dim, R)
-        )
-        self.b = torch.nn.Parameter(
-            torch.randn(R, self.out_dim * K)
-        )
-
-        self.init_weights()
-    
-    def init_weights(self) -> None:
 
         torch.nn.init.normal_(self.r, mean=0, std=0.01)
 
@@ -145,11 +181,8 @@ class DyWLinear(torch.nn.Module):
         std_b = 1.0 / math.sqrt(self.R)
         torch.nn.init.uniform_(self.b, -std_b, std_b)
 
-    def forward(
-        self,
-        x: torch.Tensor
-    ) -> torch.Tensor:
-        
-        impl = backend2impl[self.backend]
+    # @torch.compile
+    def forward(self, x):
 
+        impl = backend2impl[self.backend]
         return impl(x, self.a, self.b, self.r, self.K, self.R)
