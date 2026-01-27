@@ -267,10 +267,14 @@ def flash_attn_bwd_bshd_dq(
             b_v = tl.alloc_shared([BS, D], dtype)
             b_do = tl.alloc_shared([BT, D], dtype)
             b_lse = tl.alloc_shared([BT], accum_dtype)
+            b_delta = tl.alloc_shared([BT], accum_dtype)
 
-            b_dq = tl.alloc_fragment([BT, D], dtype)
-
+            # NOTE: if is output of gemm, use accum_dtype
+            b_dq = tl.alloc_fragment([BT, D], accum_dtype)
+            b_dp = tl.alloc_fragment([BT, BS], accum_dtype)
             b_s = tl.alloc_fragment([BT, BS], accum_dtype)
+            b_ds = tl.alloc_fragment([BT, BS], accum_dtype)
+            b_ds_cast = tl.alloc_fragment([BT, BS], dtype)
 
             # copy q and merge scale into q
             tl.copy(q[i_b, i_t * BT : (i_t + 1) * BT, i_hq, :], b_q)
@@ -278,28 +282,124 @@ def flash_attn_bwd_bshd_dq(
             for i, j in tl.Parallel(BT, D):
                 b_q[i, j] *= scale
             
+            tl.copy(do[i_b, i_t * BT : (i_t + 1) * BT, i_hq, :], b_do)
             tl.copy(lse[i_b, i_t * BT : (i_t + 1) * BT, i_hq], b_lse)
+            tl.copy(delta[i_b, i_t * BT : (i_t + 1) * BT, i_hq], b_delta)
+
 
             loop_range = (
                 tl.min(NS, tl.ceildiv((i_t + 1) * BT, BS)) if causal else NS
             )
+
+            tl.clear(b_dq)
 
             for i_s in tl.Pipelined(loop_range, num_stages=num_stages):
                 tl.copy(k[i_b, i_s * BS: (i_s + 1) * BS, i_h, :], b_k)
                 tl.copy(v[i_b, i_s * BS: (i_s + 1) * BS, i_h, :], b_v)
 
 
-            tl.clear(b_s) # NOTE: not used if we pre-mask
+                tl.clear(b_s) # NOTE: not used if we pre-mask
 
-            tl.gemm(b_q, b_k, b_s, transpose_B=True, policy=tl.GemmWarpPolicy.FullRow)
+                tl.gemm(b_q, b_k, b_s, transpose_B=True, policy=tl.GemmWarpPolicy.FullRow)
 
-            # directly calculate b_p
-            if causal:
+                # directly calculate b_p
+                if causal:
+                    for i, j in tl.Parallel(BT, BS):
+                        b_s[i, j] = tl.if_then_else(i_t * BT + i >= i_s * BS + j, tl.exp2(b_s[i, j] - b_lse[i]), 0)
+                else:
+                    for i, j in tl.Parallel(BT, BS):
+                        b_s[i, j] = tl.if_then_else(i_s * BS + j < T, tl.exp2(b_s[i, j] - b_lse[i]), 0)
+                
+                tl.clear(b_dp)
+                tl.gemm(b_do, b_v, b_dp, transpose_B=True, policy=tl.GemmWarpPolicy.FullRow)
+
+                tl.clear(b_ds)
                 for i, j in tl.Parallel(BT, BS):
-                    b_s[i, j] = tl.if_then_else(i_t * BT + i >= i_s * BS + j, tl.exp2(b_s[i, j] - b_lse[i]), 0)
-            else:
-                for i, j in tl.Parallel(BT, BS):
-                    b_s[i, j] = tl.if_then_else(i_s * BS + j < T, tl.exp2(b_s[i, j] - b_lse[i]), 0)
+                    b_ds[i, j] = b_s[i, j] * (b_dp[i, j] - b_delta[i])
+
+                tl.copy(b_ds, b_ds_cast) # [BT, BS]
+
+                tl.gemm(b_ds_cast, b_k, b_dq)
+            
+            tl.copy(b_dq, dq[i_b, i_t * BT : (i_t + 1) * BT, i_hq, :])
+
+    return main    
+
+
+def flash_attn_bwd_bshd_dkv(
+    B,
+    HQ,
+    H,
+    G,
+    T,
+    D,
+    causal=True,
+    BT=64,
+    BS=64,
+    num_stages=1,
+    threads=128,
+):
+    
+    scale = (1.0 / D) ** 0.5 * 1.4426950216 # log2(e)
+    # scale = (1.0 / D) ** 0.5 
+    shape_qo = [B, T, HQ, D]
+    shape_kv = [B, T, H, D]
+    dtype = tl.float16
+    accum_dtype = tl.float32
+
+    NT = tl.ceildiv(T, BT)
+    NS = tl.ceildiv(T, BS) # num iters for kv
+
+    # NOTE: read param first, write param later
+
+    @tl.prim_func
+    def main(
+        q: tl.Tensor(shape_qo, dtype), # type: ignore
+        k: tl.Tensor(shape_kv, dtype), # type: ignore
+        v: tl.Tensor(shape_kv, dtype), # type: ignore
+        do: tl.Tensor(shape_qo, dtype), # type: ignore
+        lse: tl.Tensor((B, T, HQ), accum_dtype), # type: ignore
+        delta: tl.Tensor((B, T, HQ), accum_dtype), # type: ignore
+        dk: tl.Tensor(shape_qo, dtype), # type: ignore
+        dv: tl.Tensor(shape_qo, dtype), # type: ignore
+    ):
+        
+        with tl.Kernel(NT, HQ, B, threads=threads) as (i_t, i_hq, i_b):
+
+            # Only read: shared
+            # Will write: register
+
+            i_h = i_hq // G
+
+            b_q = tl.alloc_shared([BS, D], dtype)
+            b_k = tl.alloc_shared([BT, D], dtype)
+            b_v = tl.alloc_shared([BT, D], dtype)
+            b_do = tl.alloc_shared([BT, D], dtype)
+            b_lse = tl.alloc_shared([BT], accum_dtype)
+            b_delta = tl.alloc_shared([BT], accum_dtype)
+
+            # NOTE: if is output of gemm, use accum_dtype
+            b_dk = tl.alloc_fragment([BT, D], accum_dtype)
+            b_dv = tl.alloc_fragment([BT, D], accum_dtype)
+            b_dp = tl.alloc_fragment([BT, BS], accum_dtype)
+            b_s = tl.alloc_fragment([BT, BS], accum_dtype)
+            b_ds = tl.alloc_fragment([BT, BS], accum_dtype)
+            b_ds_cast = tl.alloc_fragment([BT, BS], dtype)
+
+            # use i_hq, later do reduce
+            tl.copy(k[i_b, i_t * BT : (i_t + 1) * BT, i_hq, :], b_k)
+            tl.copy(v[i_b, i_t * BT : (i_t + 1) * BT, i_hq, :], b_v)
+
+            tl.clear(b_dk)
+            tl.clear(b_dv)
+
+            loop_st = 0 if causal else tl.floordiv(i_t * BT, BS)
+            # BT is the outer loop and BS is the inner loop
+            loop_ed = NS
+
+
+            
+
     
 
 def ref_attn_fwd_bshd(Q, K, V, causal):
